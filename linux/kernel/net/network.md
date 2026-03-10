@@ -311,6 +311,10 @@ send(sockfd, buffer, len, 0);
 
 - [ksoftirqd 与软中断：CPU 看起来不忙，为什么延迟却高](https://mp.weixin.qq.com/s/mo0yW0RPrZ8TO7vh7_U4IA)
 
+## rdma
+
+- [一次 RDMA Write，从 GPU 到 GPU 会经过多少个 DMA？](https://mp.weixin.qq.com/s/HkmT7SqCbcjWON7WcNPAsA)
+
 ## 丢包
 
 - [Linux服务器时不时丢包，它凭啥能精准解决？](https://mp.weixin.qq.com/s/ecRMntFeL9smXtzO-htPVA)
