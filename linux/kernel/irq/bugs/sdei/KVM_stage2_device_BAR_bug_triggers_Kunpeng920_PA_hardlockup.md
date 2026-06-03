@@ -1,8 +1,12 @@
-# MK222 Kunpeng 920 Hard LOCKUP 根因分析
+# KVM Stage2 页表错误操作 Device BAR 触发 Kunpeng 920 PA 硬件故障 → Hard LOCKUP 根因分析
 
 ## 问题概述
 
-HUAKUN MK222 服务器（Kunpeng 920, 2P, 256 核）频繁发生 hard lockup panic，根因为 **Socket 1 PA (Protocol Agent) 模块硅片级硬件故障**，导致 NoC 互联断裂、70+ CPU 核心硬件挂死。
+HUAKUN MK222 服务器（Kunpeng 920, 2P, 256 核）频繁发生 hard lockup panic，根因为 **KVM stage2 页表错误操作直通设备 BAR 空间**，导致 NoC 上产生非法 cache-coherent 事务，触发 Kunpeng 920 PA (Protocol Agent) 模块硬件故障，NoC 互联断裂、70+ CPU 核心硬件挂死。
+
+**修复方案**: 需要**按顺序**合入两个 patch：
+1. **先合入 Patch A**（链接中的 SVA patch）→ 作为前置依赖
+2. **再合入 0001.patch**（`kvm_is_device_pfn()` 拦截）→ 防止 KVM 错误修改设备 BAR 的 stage2 映射
 
 > 注: IMU 日志和 OS 内核日志使用两套独立时钟（IMU=M7固件上电起算, OS=kernel启动起算），
 > 无公共时间戳可精确对齐，以下时间线以事件因果关系和各自时钟的内部间隔为准。
@@ -284,7 +288,7 @@ ARM RAS 架构定义的 ERR_STATUS 寄存器逐位拆解：
 ### 因果链
 
 ```
-KVM stage2 页表 bug (原 SVA patch)
+Patch A (链接中的 SVA patch) 合入——引入 KVM stage2 页表 bug
       │
       ▼
 kvm_set_spte_hva() 对 device PFN 也生效
@@ -315,19 +319,13 @@ NoC 互联协议层阻塞 (TXREQ 超时)
       └── SDEI watchdog 检测到 CPU200 PC 未移动 → PANIC
 ```
 
-### 为什么需要 0001.patch 修复
+### 为什么需要 Patch A + 0001.patch 两个 patch 才能修复
 
-原始 SVA patch (d32d8baaf293) 让 KVM 对直通设备 BAR 的 stage2 页表做了不该做的操作（write-protect / cacheable 映射），导致 IO fabric 上产生非法事务，Kunpeng 920 的 PA 硬件无法处理这种异常，引发硅片级故障。
+**Patch A** (链接中的 SVA patch) 引入了此 bug——它的 `kvm_set_spte_hva()` 改动对 device PFN 也生效，当 KSM write-protect 触发 mmu_notifier 时，直通设备 BAR 的 stage2 映射被错误改为 ReadOnly/Cacheable。
 
-```c
-// 0001.patch 核心逻辑 (arch/arm64/kvm/mmu.c: kvm_set_spte_hva)
-+#ifdef CONFIG_EULEROS_VIRTUAL
-+        if (kvm_is_device_pfn(pfn))
-+                return 0;   // 设备 PFN 直接跳过，不修改 stage2 页表
-+#endif
-```
+**0001.patch** 是对 Patch A 引入 bug 的 fixup——在 `kvm_set_spte_hva()` 入口处增加 `kvm_is_device_pfn()` 判断，设备 PFN 直接返回，防止 stage2 页表错误修改设备 BAR 的属性。设备 MMIO 需要使用严格的 Device-nGnRE 内存类型，任何缓存或写保护都会在 NoC 上产生异常事务，触发 PA 硬件错误。
 
-`kvm_is_device_pfn()` 判断 PFN 是否属于设备 MMIO 空间，如果是则直接返回，**防止 stage2 页表将该映射的属性错误改写为 cacheable/readonly**。设备 MMIO 需要使用严格的 Device-nGnRE 内存类型，任何缓存或写保护都会在 NoC 上产生异常事务，触发 PA 硬件错误。
+**合入顺序**: 先合入 Patch A（链接中的 SVA patch），再在其上合入 0001.patch，缺一不可。
 
 ### Crash 证据对应 (20260529-0906)
 
@@ -392,17 +390,27 @@ NoC 互联 fabric 协议层阻塞
 
 ---
 
-## 相关补丁
+## 修复方案
 
-### Patch 1: 欧拉 OS 合入的 SVA 相关补丁
+需要**按先后顺序**合入两个 patch 才能彻底修复此问题：
 
-**文件**: 0001.patch (当前目录)
+### Patch A（前置依赖，先合入）: SVA 相关 patch
 
 **来源**:
-- 欧拉 OS commit: https://gitee.com/openeuler/kernel/commit/d30a2a28f4129b9060c4abe2ba2b6f6b226a51aa
-- 原始 SVA patch: https://jpbrucker.net/git/linux/commit/?h=sva/2021-03-01&id=d32d8baaf293aaefef8a1c9b8a4508ab2ec46c61
+- 欧拉 OS 已合入: https://gitee.com/openeuler/kernel/commit/d30a2a28f4129b9060c4abe2ba2b6f6b226a51aa
+- 原始 SVA 补丁: https://jpbrucker.net/git/linux/commit/?h=sva/2021-03-01&id=d32d8baaf293aaefef8a1c9b8a4508ab2ec46c61
 
-**说明**: 华为硬件提供的 patch，修复 KVM stage2 页表对直通设备 BAR 空间的错误处理。欧拉 OS 是为了解决 ARM 硬件问题而合入的（与鲲鹏强相关），但**未合入内核上游**。华为硬件给的 patch 不止内核上游没有合入，连欧拉 OS 都没有合入（理论上貌似能讲通，但实际上怀疑华为硬件也没有验证过，说服不了欧拉 OS 合入）。
+**说明**: 欧拉 OS 合入此 patch 是为了解决 ARM 硬件问题（与鲲鹏强相关），但**未合入内核上游**。华为硬件给的 patch 不止内核上游没有合入，连欧拉 OS 都没有合入（理论上貌似能讲通，但实际上怀疑华为硬件也没有验证过，即说服不了欧拉 OS 合入）。
+
+该 patch 引入了 SVA (Shared Virtual Addressing) 功能中对 `kvm_set_spte_hva()` 的改动，当两个 vCPU 并发访问直通设备的 BAR 地址时，可能导致 KVM stage2 页表被错误设置为 ReadOnly cacheable，对 BAR 空间不可接受。
+
+### Patch B（在 Patch A 之上合入）: 0001.patch（当前目录）
+
+**文件**: `0001.patch`
+
+**说明**: 在 Patch A 合入后，必须再合入 0001.patch 才能真正修复问题。0001.patch 是对 Patch A 引入 bug 的 fixup——在 `kvm_set_spte_hva()` 中增加 `kvm_is_device_pfn()` 判断，对设备 PFN 直接返回，防止 stage2 页表错误修改设备 BAR 的属性。
+
+**合入顺序**: Patch A（链接中的 SVA patch）→ Patch B（0001.patch），缺一不可。
 
 ```diff
 From 2f7444e38b7bd8bee9e452ffb59ea14046746efc Mon Sep 17 00:00:00 2001
@@ -445,10 +453,3 @@ index 0a8e74b77..f7a8270aa 100644
 
 1. 华为硬件给的 patch 能否确定解决问题，只能说理论上很像能解决的样子，华为硬件自己也都没有承诺
 2. 补丁的副作用目前看影响不大，也经过 OS 测试热补丁压测，目前不能稳定确信的情况下，建议跟着上
-
----
-
-## 建议
-
-- **合入 0001.patch** — 修复 KVM stage2 页表对直通设备 BAR 空间的错误处理，防止 PA 硬件被非法 cache-coherent 事务触发
-- 同时排查 **PCIe Card 5 (Zijin-DPU2.5)** 的 Surprise Down Error (93) 反复异常（近 2 个月内 26+ 次，独立问题）
