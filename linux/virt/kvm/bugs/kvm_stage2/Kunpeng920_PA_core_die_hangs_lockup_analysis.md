@@ -1,28 +1,41 @@
-# KVM Stage2 页表错误操作 Device BAR 触发 Kunpeng 920 PA 硬件故障 → Hard LOCKUP 根因分析
+# Kunpeng 920 多 die core hangs 导致 soft/hard lockup 问题分析
 
 ## 问题概述
 
-HUAKUN MK222 服务器（Kunpeng 920, 2P, 256 核）频繁发生 hard lockup panic，根因为 **KVM stage2 页表错误操作直通设备 BAR 空间**，导致 NoC 上产生非法 cache-coherent 事务，触发 Kunpeng 920 PA (Protocol Agent) 模块硬件故障，NoC 互联断裂、70+ CPU 核心硬件挂死。
+HUAKUN MK222 服务器（Kunpeng 920, 2P, 256 核）频繁发生 soft/hard lockup，表现为 PA (Protocol Agent) 模块硬件故障（`ERR_STATUS=0x64100214`），导致 NoC 互联上多个 die 的核心硬件挂死（core hangs），进而触发软件层连锁死锁（KSM/RCU 路径持 spin_lock 的核心挂死后其他 CPU 无法获取锁）。
 
-**修复方案**: 需要**按顺序**合入两个 patch：
-1. **先合入 Patch A**（链接中的 SVA patch）→ 作为前置依赖
-2. **再合入 0001.patch**（`kvm_is_device_pfn()` 拦截）→ 防止 KVM 错误修改设备 BAR 的 stage2 映射
+截至 2026-06-04，已在**三台不同机器**上复现（SN: 2102315FAB10R2100044 / 2102315FAB10R2100045 / 2106114652FSQC000033），PA 故障寄存器签名完全一致，排除单颗 CPU 缺陷。
+
+**触发路径**已知有多种，包括：
+- KSM + KVM stage2 页表操作（`kvm_mmu_notifier_invalidate_range_start` → `write_protect_page`）
+- 用户态进程普通缺页（`handle_pte_fault` → `do_numa_page` / `do_anonymous_page`）
+
+**当前推测**：不同软件路径均可在 NoC 上产生 PA 无法正确处理的事务模式，根因可能在 PA 固件/TLB 硬件侧（如 ATF/BL31 中 MMU/SMMU 相关逻辑或 PA microcode 缺陷），待硬件厂商进一步确认。
+
+**修复尝试**: 0001.patch（`khotfix_42044049`）通过 `kvm_is_device_pfn()` 拦截了 KVM stage2 路径，但加载后 PA 故障仍从非 KVM 路径触发，**0001.patch 不保证完全修复**。
 
 > 注: IMU 日志和 OS 内核日志使用两套独立时钟（IMU=M7固件上电起算, OS=kernel启动起算），
 > 无公共时间戳可精确对齐，以下时间线以事件因果关系和各自时钟的内部间隔为准。
 
 ---
 
-## 四份 BMC 日志汇总
+## 五份 BMC 日志汇总
 
-| 文件 | 机器 S/N | 采集日期 | `core hangs` in imu_log | `kvm+write_protect` in systemcom |
-|------|----------|----------|-------------------------|---------------------------------|
-| `MK222_2102315FAB10R2100045_20260529-0906.tar.gz` | 2102315FAB10R2100045 | 2026-05-29 | **有** — skt[1] die[3], skt[1] die[1], skt[0] die[3] | **有** |
-| `MK222_2102315FAB10R2100044_20260104-1149.tar.gz` | 2102315FAB10R2100044 | 2026-01-04 | **有** — skt[0] die[3], skt[0] die[1] | **无** (crash 太快日志未达串口) |
-| `MK222_2106114652FSQC000030_20260114-1419.tar.gz` | 2106114652FSQC000030 | 2026-01-14 | **有** — skt[0] die[3], skt[1] die[1] | **无** (crash 太快日志未达串口) |
-| `MK222_2102315FAB10R2100045_20260513-0949.tar.gz` | 2102315FAB10R2100045 | 2026-05-13 | **无** | **无** |
+| 文件 | 机器 S/N | 采集日期 | `core hangs` in imu_log | systemcom Call trace | Livepatch |
+|------|----------|----------|-------------------------|----------------------|-----------|
+| `MK222_2102315FAB10R2100045_20260529-0906.tar.gz` | 2102315FAB10R2100045 | 2026-05-29 | **有** — skt[1] die[3], skt[1] die[1], skt[0] die[3] | **kvm_mmu_notifier + write_protect_page** (ksmd) | 无 |
+| `MK222_2102315FAB10R2100044_20260104-1149.tar.gz` | 2102315FAB10R2100044 | 2026-01-04 | **有** — skt[0] die[3], skt[0] die[1] | **无** (crash 太快日志未达串口) | 无 |
+| `MK222_2106114652FSQC000030_20260114-1419.tar.gz` | 2106114652FSQC000030 | 2026-01-14 | **有** — skt[0] die[3], skt[1] die[1] | **无** (crash 太快日志未达串口) | 无 |
+| `MK222_2106114652FSQC000033_20260604-0116.tar.gz` | **2106114652FSQC000033** | **2026-06-04** | **有** — skt[1] die[3], skt[1] die[1], skt[0] die[3] | **handle_pte_fault (haproxy)** ← 非 KVM 路径！ | **khotfix_42044049** |
+| `MK222_2102315FAB10R2100045_20260513-0949.tar.gz` | 2102315FAB10R2100045 | 2026-05-13 | **无** | **无** | 无 |
 
-**关键发现**：三份有 `core hangs` 的日志中，`ERR_STATUS`、`ERR_FR`、`ERR_CTRL`、`ERR_MISC1`、`PA_COMMON_INT` 完全一致，说明 PA 硬件被完全相同类型的非法 NoC 事务触发了同一种内部故障。`20260513` 是独立问题（无 core hangs），排除了 `kvm+write_protect` 路径。
+**关键发现**:
+
+1. **第四台机器** (2106114652FSQC000033, 硬件 `Huawei MK222/BC83AMDA01`) 复现了完全一致的 PA 故障签名 (`ERR_STATUS=0x64100214`) — **排除单颗 CPU 缺陷，确认为软件层面触发**。
+
+2. **20260604 加载了 `khotfix_42044049(OEK)` livepatch** (kernel taint `K`)，该 hotfix **可能拦截了 KVM stage2 路径**，导致本次 crash 中不见 `kvm_mmu_notifier` 调用栈。
+
+3. **但 PA 故障仍然发生** — Call trace 显示 `handle_pte_fault` → `do_page_fault` (用户态 haproxy 进程的普通缺页)，说明仅拦截 KVM 路径不够，**普通 MM 缺页路径（`do_numa_page`、`do_anonymous_page`）也能在 NoC 上产生触发 PA 故障的非法事务**。这可能与 Patch A 引入的 stage2 属性错误不仅限于 device BAR，而是对更广泛的页面类型也有影响。
 
 ---
 
@@ -191,6 +204,43 @@ imu_log:616                                  systemcom.dat:28407,28414
 | 2306 | — | `skt[1] die[1] core hangs!` (nocmt0[0xc]) |
 | 2379 | — | `skt[1] die[1] core hangs!` |
 
+### 20260604-0116 — IMU/BMC 固件 (imu_log)
+
+| 行号 | IMU 时间 | 内容 |
+|------|----------|------|
+| 411 | `[36.54.54.470]` | `Receive ras int[491]` — RAS 中断触发 |
+| 423 | — | `ERR_STATUS=0x0000000064100214` |
+| 430 | — | `PA_COMMON_INT = 0x00000008` |
+| 433 | — | `PA_sky_txreq_timeout_queue_idx = 0x00000071` — TXREQ 队列超时 |
+| 434 | — | `PA_SKY_TXREQ_QUEUE_CMD_DATA0 = 0x0004409a` |
+| 440 | — | `ras int[491] end` |
+| 441 | — | `skt[1] die[3] core hangs!` (nocmt0[0x2000000]) |
+| 443 | — | `skt[1] die[3] core hangs!` (nocmt0[0x1000000]) |
+| 513 | — | `skt[1] die[1] core hangs!` (nocmt0[0x4]) |
+| 515 | — | `skt[1] die[1] core hangs!` (nocmt0[0x8]) |
+| 517 | — | `skt[1] die[3] core hangs!` (nocmt0[0x2000]) |
+| 520 | — | `DFX DEBUG START` — 固件开始全面寄存器采集 |
+| 522 | — | `skt[0] die[3] core hangs!` (nocmt0[0x8000000]) — 跨 Socket |
+| 524 | — | `skt[0] die[3] core hangs!` (nocmt0[0x2]) |
+| 526 | — | `skt[1] die[1] core hangs!` (nocmt0[0x10]) |
+
+### 20260604-0116 — Linux 内核日志 (systemcom.dat)
+
+**新特点**: 本次机器加载了 `khotfix_42044049(OEK)` livepatch（kernel taint: `OELK`），KVM stage2 路径可能已被热补丁拦截。但 PA 故障仍从不同调用路径触发 — 不再是 `kvm_mmu_notifier` 路径，而是**用户态 haproxy 进程的普通缺页处理** (`handle_pte_fault`)。
+
+| 行号 | OS 时间 | 内容 |
+|------|---------|------|
+| 24115 | `132836.643` | `rcu: INFO: rcu_sched detected stalls on CPUs/tasks: 153, 166, 167` |
+| 24121 | `132842.105` | `soft lockup - CPU#112 stuck for 22s! [haproxy:5168]` |
+| 24124 | `132842.138` | `soft lockup - CPU#120 stuck for 22s! [haproxy:5169]` |
+| 24389 | `132843.084` | CPU112 Call trace: `native_queued_spin_lock_slowpath` → `handle_pte_fault` → `__handle_mm_fault` → `handle_mm_fault` → `do_page_fault` → `do_translation_fault` → `do_mem_abort` → `el0_da` → `el0_sync` |
+| 24431 | `132843.334` | CPU120 Call trace: `native_queued_spin_lock_slowpath` (lr=`do_numa_page`) → `handle_pte_fault` → `__handle_mm_fault` → ... → `el0_sync` |
+| 24523 | `132850.104` | `soft lockup - CPU#78 stuck for 23s! [haproxy:5170]` |
+| 24547 | `132850.411` | CPU78 Call trace: `native_queued_spin_lock_slowpath` (lr=`do_anonymous_page`) → `handle_pte_fault` → ... → `el0_sync` |
+| 24443+ | — | `Sending IPI failed to CPU 0-33, ...` (大规模 IPI 失败) |
+
+**关键**: 本次无 `Hard LOCKUP` → 无 kernel panic。系统停留在 soft lockup 状态（由 RCU stall → NMI 回扫 → IPI 失败的循环）。三个 haproxy 进程分别卡在 `do_numa_page`、`do_anonymous_page`、`handle_pte_fault`，均属于普通 MM 缺页处理路径。
+
 ### 20260529-0906 — Linux 内核日志 (systemcom.dat)
 
 | 行号 | OS 时间 | 内容 |
@@ -269,7 +319,7 @@ ARM RAS 架构定义的 ERR_STATUS 寄存器逐位拆解：
 
 ### 四份日志中完全一致的故障签名
 
-所有三份有 `core hangs` 的 `imu_log` 中，以下寄存器值 **完全一致**：
+所有四份有 `core hangs` 的 `imu_log` 中（三台不同机器），以下寄存器值 **完全一致**：
 
 | 寄存器 | 值 |
 |--------|-----|
@@ -279,7 +329,7 @@ ARM RAS 架构定义的 ERR_STATUS 寄存器逐位拆解：
 | ERR_MISC1 | `0x0000000000000100` |
 | PA_COMMON_INT | `0x00000008` |
 
-**这不是巧合**，说明 PA 硬件被完全相同类型的非法 NoC 事务触发了同一种内部故障。KVM stage2 页表错误将 device BAR 映射改为 cacheable 后，IO fabric 上产生的一致性探测请求就是这种非法事务。
+**这不是巧合**，说明 PA 硬件被完全相同类型的非法 NoC 事务触发了同一种内部故障。三台不同机器的完全一致故障签名**排除了单颗 CPU 缺陷，确认为软件层面触发**。
 
 ---
 
@@ -325,7 +375,9 @@ NoC 互联协议层阻塞 (TXREQ 超时)
 
 **0001.patch** 是对 Patch A 引入 bug 的 fixup——在 `kvm_set_spte_hva()` 入口处增加 `kvm_is_device_pfn()` 判断，设备 PFN 直接返回，防止 stage2 页表错误修改设备 BAR 的属性。设备 MMIO 需要使用严格的 Device-nGnRE 内存类型，任何缓存或写保护都会在 NoC 上产生异常事务，触发 PA 硬件错误。
 
-**合入顺序**: 先合入 Patch A（链接中的 SVA patch），再在其上合入 0001.patch，缺一不可。
+**修复顺序**: 先合入 Patch A（链接中的 SVA patch），再在其上合入 0001.patch，缺一不可。
+
+**⚠️ 注意**: 0001.patch（`khotfix_42044049`）仅拦截了 KVM stage2 路径（`kvm_set_spte_hva` 中的 `kvm_is_device_pfn()` 判断），但从第四台机器的 crash 来看，加载 hotfix 后 PA 故障仍从用户态普通缺页路径（`handle_pte_fault`）触发。**0001.patch 不保证完全修复**，根因可能不在软件侧，需进一步排查 Kunpeng 920 PA 固件/TLB 硬件缺陷。
 
 ### Crash 证据对应 (20260529-0906)
 
