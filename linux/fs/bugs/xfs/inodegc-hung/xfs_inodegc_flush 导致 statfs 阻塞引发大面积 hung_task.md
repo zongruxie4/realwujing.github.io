@@ -180,6 +180,8 @@ writeback (flush-253:16) worker（卡在 inode cluster buffer 锁 / down()）
 2. `xfs-inodegc` 与 `writeback` 两个 worker 卡在各自的 `xfs_buf_lock` 上，是在等对应 buffer 的 I/O 完成，未见 ABBA 循环等待。
 3. 监控/agent 进程大量 D 状态是 `xfs_fs_statfs -> xfs_inodegc_flush -> flush_work` 这条路径的放大效应，只要 inodegc worker 恢复，statfs 调用方会一起解除阻塞，不需要单独处理。
 
+**局限性说明**：本次只拿到了全量 dmesg，没有 vmcore。dmesg 里能看到的只是"卡在 `xfs_buf_lock` 的 `down()` 上"，看不到这块 buffer 当时的持锁者是谁、在做什么——上面"未见 ABBA 循环等待"的结论只是"没有证据支持死锁"，不等于"证明了不是死锁"。如果后续同类故障能拿到 vmcore，应该用 crash 工具进一步确认持锁上下文，才能把这个结论坐实。
+
 ## inodegc 特性背景：它是干什么的
 
 `inodegc`（inode garbage collection）是 XFS 在 **v5.15-rc1** 引入的优化（`ab23a7768739`，"xfs: per-cpu deferred inode inactivation queues"），本次故障里 `xfs-inodegc/vdb` worker 就是这个特性的产物。
@@ -290,10 +292,41 @@ xfs_fs_statfs(
 
 **注意**：`a8d377cf6862`（"release: develop 0096"）是 `heads/ctkernel-lts-5.10/develop` 当前已经发布的最新版本，用 `git merge-base --is-ancestor a435f02700ae6 heads/ctkernel-lts-5.10/develop` 核实过，结果是 **0096 里也没有这个修复**——不是"要等到 0096 才修"，而是**0096 目前也是缺这个修复的**。截至目前，任何一个已发布的 develop 版本都不包含它，修复只静静躺在落后主线的 `lchen/xfs-statfs` 分支上。要让它生效，需要把这个分支 rebase 到最新 develop 后合入，落到**下一个**版本（0097 或之后的某个版本），而不是已发布的 0096。
 
+**补充说明**：`xfs_inodegc_push()` 解决的只是"慢盘/长耗时 inodegc 不该拖死无关的 `statfs` 调用方"这个放大效应，不是万能药——如果 `xfs-inodegc` worker 卡住的根因是 buffer 锁上真正的 ABBA 死锁（而不是本次这种"等 I/O 完成"），合入这个补丁之后 inodegc worker 本身该卡还是卡，只是不会再连带拖死一大片调 `statfs` 的监控进程。本次故障没有 vmcore，无法 100% 排除前者。
+
+## inodegc 相关修复全景对比：CTyunOS vs openEuler
+
+以 inodegc 特性（`ab23a7768739`）为起点，upstream 目前一共有 6 个与之相关的后续修复。逐一核对 CTyunOS `ctkernel-lts-5.10/develop` 与 openEuler `OLK-5.10` 分支的合入情况：
+
+| upstream 提交 | 版本 | CTyunOS `ctkernel-lts-5.10/develop` | CTyunOS 合入者（含合入版本） | openEuler `OLK-5.10` | openEuler 合入者 |
+|---|---|---|---|---|---|
+| `ab23a7768739` per-cpu deferred inode inactivation queues（特性本身） | v5.15-rc1 | ✅ `705fccfbcf0b8` | **release-0090 起含**（2025-03-08；直接复用 openEuler 原始提交对象，未额外背移植），committer **Zheng Zengkai**（华为），原始背移植 SoB **Lihong Kou**（华为） | ✅ 同 `705fccfbcf0b8` | SoB **Lihong Kou**，Reviewed-by **Zhang Yi**，committer **Zheng Zengkai**（均华为） |
+| `04a98a036cf8` flush inode gc workqueue before clearing agi bucket | v5.19-rc2 | ✅ `ef4894f06a4a4` | **release-0090 起含**（与特性本身一起进的，同样直接复用 openEuler 原始提交对象），committer **Zheng Zengkai** | ✅ 同 `ef4894f06a4a4` | Author **Zhang Yi**，SoB **Guo Xuenan**，Reviewed-by **Zhang Yi**，committer **Zheng Zengkai**（均华为） |
+| `6191cf3ad59fd` flush inodegc workqueue tasks before cancel | v5.17-rc1 | ❌ 变体 `26b5a22d7a83f` 躺在未合入的 `lchen/xfs-statfs` 分支 | **任何已发布 release 版本都不含**（含最新 release-0096）。committer **Li Chen**（`chenl311`），内容照搬 openEuler 的 `I6WKVJ` 背移植版本（SoB **Guo Xuenan**/Reviewed-by **Yang Erkun**/SoB **Jialin Zhang**，均华为），2025-08-27 搬入 `lchen/xfs-statfs` 分支，至今未合入 develop | ✅ `ad0a103e90651` | SoB **Guo Xuenan**，Reviewed-by **Yang Erkun**，committer **Jialin Zhang**（均华为），2023-04-26 |
+| `5e672cd69f0a53` **introduce xfs_inodegc_push()** | v5.19-rc5 | ❌ 变体 `a435f02700ae6` 同样躺在 `lchen/xfs-statfs`，未合入 | **任何已发布 release 版本都不含**（含最新 release-0096）。committer **Li Chen**，同样是照搬 openEuler `I6WKVJ` 版本，2025-08-27 搬入但未合入 develop | ✅ `cc10c7d993f28` | SoB **Guo Xuenan**，Reviewed-by **Yang Erkun**，committer **Jialin Zhang**，2023-04-26 |
+| `7cf2b0f9611b9` bound maximum wait time for inodegc work | v5.19-rc5 | ❌ 任何分支都没有，连准备都没准备 | **任何已发布 release 版本都不含**，任何分支都没有——连搬都没搬 | ✅ `cfb1750859363` | SoB **Guo Xuenan**，Reviewed-by **Yang Erkun**，committer **Jialin Zhang**，2023-04-26（和上面 push/cancel-flush 是同一批背移植） |
+| `2d873efd174ba` flush inodegc before swapon | v6.14-rc4 | ✅ `6c588c827e2ef` | **release-0094 起含**（2025-07-29；release-0092/2025-04-29 时还不含）。SoB **Li Chen**，Reviewed-by/committer **Bin Lai**（`laib2`），2025-07-16 合入，内部单号 `CTKfeat: #84056`——这个是 CTyunOS **自己单独背移植**的（openEuler 没有这个提交，搬不了） | ❌ 没有 | — |
+| `62334fab47621` use per-mount cpumask to track nonempty percpu inodegc lists | v6.6-rc3 | ❌ 任何分支都没有 | **任何已发布 release 版本都不含**，`lchen/xfs-statfs` 等任何分支都没有——连搬都没搬。用 `git patch-id` 对动过 `xfs_icache.c`/`xfs_mount.h`/`xfs_mount.c`/`xfs_super.c` 的提交做过内容级扫描，排除了换措辞的重写版本 | ❌ 任何分支都没有 | — |
+
+结论：openEuler 合了 4 个修复只缺 swapon 那个，且这 4 个修复是华为团队（Guo Xuenan/Yang Erkun/Jialin Zhang/Zhang Yi/Zheng Zengkai）在 2023-04-26 一次性批量背移植进去的；CTyunOS 只合了 2 个（agi-bucket 那个 + swapon 那个），前两个（特性本身 + agi-bucket）是直接复用 openEuler 的原始提交对象（连 hash 都没变），没有 CTyunOS 自己的背移植记录，只有 swapon 这一个是 Li Chen/Bin Lai 在 2025-07-16 独立背移植的。本次案例真正相关的 `xfs_inodegc_push`、`cancel 前 flush`、`bound wait time` 三个 CTyunOS 全都没合——其中 push、cancel-flush 已经由 Li Chen 在 2025-08-27 把 openEuler 现成的背移植版本（`I6WKVJ`）搬进了 `lchen/xfs-statfs` 分支，只是没合到 develop；bound-wait-time 目前连搬都没搬。此外 `62334fab47621`（use per-mount cpumask to track nonempty percpu inodegc lists，v6.6-rc3，修复一个 inodegc flush 相关的理论 UAF）是双方都完全没背、都没准备的一个修复，属于新发现的缺口。
+
+**背移植顺序倒挂的问题**：CTyunOS 已合入的 `6c588c827e2ef`（flush inodegc before swapon）commit message 里原样带着 `Fixes: 5e672cd69f0a53 ("xfs: introduce xfs_inodegc_push()")`，也就是说这个 patch 本身是在修复 `xfs_inodegc_push()` 引入之后才会出现的一个竞态（swapon 场景）。但 `xfs_inodegc_push()` 本身（`a435f02700ae6`）在 CTyunOS 里至今没有合入——相当于合了"修复 A 引入的问题"的补丁，却没合 A 本身，背移植顺序是倒着来的。
+
+`6c588c827e2ef` 的合入信息：
+
+- **合入版本**：`release-0092`（2025-04-29）不包含，`release-0094.rc1`（2025-07-29）开始包含，此后一直延续到当前最新的 `release-0096`——即从 **0094** 版本起合入。
+- **合入时间**：2025-07-16
+- **背移植者**（Signed-off-by）：Li Chen `<chenl311>`
+- **Review 者**（Reviewed-by，同时也是 committer）：Bin Lai `<laib2>`
+- **内部特性单号**：`CTKfeat: #84056`
+- 上游作者链完整保留：Christoph Hellwig（author）→ Darrick J. Wong / Dave Chinner（review）→ Carlos Maiolino（xfs maintainer 合入 upstream）
+
 ## 后续排查建议
 
 1. 对照该主机同一时间窗口（15:09–15:13）的存储后端/hypervisor 侧监控与日志，确认 `vdb` 是否存在慢 I/O、超时重传或宿主机侧异常。
 2. 检查 `/proc/diskstats` 或历史 `iostat -x` 采样数据，确认 `vdb` 在故障窗口内的 `await`/`svctm` 是否有异常尖峰。
-3. 确认故障是否随宿主机 I/O 恢复而自愈（后续 dmesg 里若无 XFS shutdown / `Corruption of in-memory data` 等信息，说明只是慢，未导致文件系统被强制只读）。
-4. **不需要重新 cherry-pick，直接跟 `remotes/ctkernel-lts-5.10/lchen/xfs-statfs` 这个已有分支的作者对齐、把它 rebase 到最新 develop 后合入即可**：分支上的两个提交 `26b5a22d7a83f`（flush inodegc workqueue tasks before cancel）+ `a435f02700ae6`（introduce xfs_inodegc_push）已经是背移植好的版本，只是落后 develop 一段时间没跟上；同时建议核对该厂商内核在背 inodegc 特性（`705fccfbcf0b8` / 对应 upstream `ab23a7768739`）时，到这个修复提交之间是否还漏了其他相关 fix。
-5. 这个内核补丁解决的是"慢盘不该拖死无关进程"这个放大效应，并不能让 `vdb` 本身变快——存储侧的慢 I/O 根因仍需按第 1、2 条单独排查。
+3. 确认故障是否随宿主机 I/O 恢复而自愈（后续 dmesg 里若无 XFS shutdown / `Corruption of in-memory data` 等信息，说明只是慢，未导致文件系统被强制只读）。若后续能拿到 vmcore，建议用 crash 工具进一步确认 AGF/inode cluster buffer 当时的持锁上下文，排除真正死锁的可能。
+4. **不需要重新 cherry-pick，直接跟 `remotes/ctkernel-lts-5.10/lchen/xfs-statfs` 这个已有分支的作者对齐、把它 rebase 到最新 develop 后合入即可**：分支上的两个提交 `26b5a22d7a83f`（flush inodegc workqueue tasks before cancel）+ `a435f02700ae6`（introduce xfs_inodegc_push）已经是背移植好的版本，只是落后 develop 一段时间没跟上。
+5. 额外建议补齐 `7cf2b0f9611b9`（bound maximum wait time for inodegc work，v5.19-rc5）：这个修复目前在 CTyunOS 任何分支里都不存在，openEuler `OLK-5.10` 已有对应版本 `cfb1750859363`，可以直接参考背移植。
+6. 再额外建议补齐 `62334fab47621`（use per-mount cpumask to track nonempty percpu inodegc lists，v6.6-rc3）：这个修复 openEuler 也没有，没有现成版本可抄，需要直接从 upstream cherry-pick，建议和上面几个一起统一排期背移植。
+7. 这个内核补丁解决的是"慢盘不该拖死无关进程"这个放大效应，并不能让 `vdb` 本身变快，也不保证解决真正的 buffer 锁死锁——存储侧的慢 I/O 根因仍需按第 1、2 条单独排查，死锁可能性需要 vmcore 才能排除。
