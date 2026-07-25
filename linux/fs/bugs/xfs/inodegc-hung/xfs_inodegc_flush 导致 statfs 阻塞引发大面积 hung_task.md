@@ -195,10 +195,57 @@ writeback (flush-253:16) worker（卡在 inode cluster buffer 锁 / down()）
 
 ### 环境准备
 
-vmcore 是在 host 上用 `virsh qemu-monitor-command --hmp <vm> "dump-guest-memory -z /path/to/xxx.img"` 导出的（`-z` = kdump 压缩格式，zlib 压缩，不是标准 ELF，`file` 认不出来、`makedumpfile` 也不能直接处理，但 `crash` 能原生识别）。用到的 debuginfo：
+vmcore 是在 host 上用 `virsh qemu-monitor-command --hmp <vm> "dump-guest-memory -z /path/to/xxx.img"` 导出的（`-z` = kdump 压缩格式，zlib 压缩，不是标准 ELF，`file` 认不出来、`makedumpfile` 也不能直接处理，但 `crash` 能原生识别）。
+
+先加载全部模块符号：
+
+```
+mod -S
+```
+
+输出（节选，都是跟 XFS 无关的存储/控制台/显卡驱动加载失败，可以忽略）：
+
+```
+mod: cannot find or load object file for ata_piix module
+mod: cannot find or load object file for failover module
+mod: cannot find or load object file for virtio_blk module
+mod: cannot find or load object file for serio_raw module
+mod: cannot find or load object file for net_failover module
+mod: cannot find or load object file for virtio_console module
+mod: cannot find or load object file for ata_generic module
+mod: cannot find or load object file for cirrus module
+mod: cannot find or load object file for ghash_clmulni_intel module
+mod: cannot find or load object file for crc32c_intel module
+```
+
+真正要用的是 `xfs.ko`，先确认机器上这个模块文件的状态：
+
+```
+ls -l /lib/modules/5.10.0-136.12.0.92.ctl3.x86_64/kernel/fs/xfs/xfs.ko.xz
+```
+
+输出：
+
+```
+-rw-r--r-- 1 root root 514780 Apr 29  2025 /lib/modules/5.10.0-136.12.0.92.ctl3.x86_64/kernel/fs/xfs/xfs.ko.xz
+```
+
+这个是压缩过的裸模块（`.xz`），没有调试符号。真正带 DWARF 调试信息的是单独的 debuginfo 包：
+
+```
+ls -l /lib/debug/lib/modules/5.10.0-136.12.0.92.ctl3.x86_64/kernel/fs/xfs/xfs.ko-5.10.0-136.12.0.92.ctl3.x86_64.debug
+```
+
+输出：
+
+```
+-r--r--r-- 1 root root 35960528 Apr 29  2025 /lib/debug/lib/modules/5.10.0-136.12.0.92.ctl3.x86_64/kernel/fs/xfs/xfs.ko-5.10.0-136.12.0.92.ctl3.x86_64.debug
+```
+
+（35MB，比裸 `.ko` 大得多，确认这个才是带符号的）。用到的 debuginfo 汇总：
 
 - 内核本体：`/usr/lib/debug/lib/modules/5.10.0-136.12.0.92.ctl3.x86_64/vmlinux`
-- `xfs.ko` 模块符号：机器上的 `/lib/modules/.../kernel/fs/xfs/xfs.ko.xz` 是压缩过的裸模块，没有调试符号；真正带 DWARF 调试信息的是 `/lib/debug/lib/modules/.../kernel/fs/xfs/xfs.ko-5.10.0-136.12.0.92.ctl3.x86_64.debug`（35MB，比裸 `.ko` 大得多），用 `mod -s xfs <这个 .debug 文件>` 加载。
+- `xfs.ko` 模块符号：用 `mod -s xfs /lib/debug/lib/modules/5.10.0-136.12.0.92.ctl3.x86_64/kernel/fs/xfs/xfs.ko-5.10.0-136.12.0.92.ctl3.x86_64.debug` 加载。
 
 ### 第 1 步：`ps | grep UN` —— D 状态任务的真实规模比 dmesg 大得多
 
@@ -223,10 +270,70 @@ vmcore 是在 host 上用 `virsh qemu-monitor-command --hmp <vm> "dump-guest-mem
 struct xfs_buf ff38011c00dd7000
 ```
 
+输出：
+
+```
+struct xfs_buf {
+  b_rhash_head = {
+    next = 0xff38011c02e36000
+  },
+  b_bn = 172846663860225,
+  b_length = 16777473,
+  b_hold = {
+    counter = 514
+  },
+  b_lru_ref = {
+    counter = 6
+  },
+  b_flags = 63802947,
+  b_sema = {
+    lock = {
+      raw_lock = {
+        {
+          val = {
+            counter = 27701546
+          },
+          {
+            locked = 42 '*',
+            pending = 177 '\261'
+          },
+          {
+            locked_pending = 45354,
+            tail = 422
+          }
+        }
+      }
+    },
+    count = 52,
+    wait_list = {
+      next = 0x9f94000006498,
+      prev = 0x0
+    }
+  },
+  ...（b_lru/b_lock/b_state/b_io_error/b_waiters/b_list/b_pag/b_mount/b_target/
+      b_addr/b_ioend_work/b_iowait/b_log_item/b_maps/b_page_count/b_offset/
+      b_error/b_last_error/b_ops 等字段——数值同样全部异常，此处从略）
+}
+```
+
 结果：`b_hold.counter = 514`、`b_flags = 63802947`、`b_sema.wait_list.next = 0x9f94000006498` 等字段全是明显不合理的爆炸值。
 
 ```
 kmem ff38011c00dd7000
+```
+
+输出：
+
+```
+CACHE            OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME
+ff380114c0034b00     1024    1500019   1633888  51059   32k  kmalloc-1k
+  SLAB              MEMORY            NODE  TOTAL  ALLOCATED  FREE
+  ffe7f9c821037400  ff38011c00dd0000     1     32         32     0
+  FREE / [ALLOCATED]
+  [ff38011c00dd7000]
+
+      PAGE            PHYSICAL      MAPPING            INDEX CNT FLAGS
+ffe7f9c8210375c0     840dd7000     dead000000000400       0   0  57fffffc0000000
 ```
 
 结果：这个地址属于通用 `kmalloc-1k` 缓存，不是 XFS 专用的 buffer slab——说明地址本身是个合法对象，但**类型猜错了**（不是 `xfs_buf`）。这个地址后来在第 8 步查明其实是 `xfs_perag`（AGI/AGF 所在 AG 的元数据结构），只是这一步误当成 `xfs_buf` 去解析，字段全部错位导致看起来像垃圾值。
@@ -239,13 +346,148 @@ kmem ff38011c00dd7000
 struct -o xfs_buf
 ```
 
+输出：
+
+```
+struct xfs_buf {
+    [0] struct rhash_head b_rhash_head;
+    [8] xfs_daddr_t b_bn;
+   [16] int b_length;
+   [20] atomic_t b_hold;
+   [24] atomic_t b_lru_ref;
+   [28] xfs_buf_flags_t b_flags;
+   [32] struct semaphore b_sema;
+   [56] struct list_head b_lru;
+   [72] spinlock_t b_lock;
+   [76] unsigned int b_state;
+   [80] int b_io_error;
+   [88] wait_queue_head_t b_waiters;
+  [112] struct list_head b_list;
+  [128] struct xfs_perag *b_pag;
+  [136] struct xfs_mount *b_mount;
+  [144] xfs_buftarg_t *b_target;
+  [152] void *b_addr;
+  [160] struct work_struct b_ioend_work;
+  [224] struct completion b_iowait;
+  [256] struct xfs_buf_log_item *b_log_item;
+  [264] struct list_head b_li_list;
+  [280] struct xfs_trans *b_transp;
+  [288] struct page **b_pages;
+  [296] struct page *b_page_array[2];
+  [312] struct xfs_buf_map *b_maps;
+  [320] struct xfs_buf_map __b_map;
+  [336] int b_map_count;
+  [340] atomic_t b_pin_count;
+  [344] atomic_t b_io_remaining;
+  [348] unsigned int b_page_count;
+  [352] unsigned int b_offset;
+  [356] int b_error;
+  [360] int b_retries;
+  [368] unsigned long b_first_retry_time;
+  [376] int b_last_error;
+  [384] const struct xfs_buf_ops *b_ops;
+}
+SIZE: 392
+```
+
 结果：`b_sema` 在偏移 **0x20**，不是第 4 步瞎猜时以为的 `0x98`（`0x98` 其实是 `b_addr` 字段的偏移）。
 
 再反汇编 `down()`/`__down()`，精确搞清楚 `sem` 参数在栈上/寄存器里的传递路径：
 
 ```
 dis -l down 30
+```
+
+输出：
+
+```
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 54
+0xffffffff90d53ee0 <down>:        nopl   0x0(%rax,%rax,1) [FTRACE NOP]
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 57
+0xffffffff90d53ee5 <down+5>:       push   %rbp
+0xffffffff90d53ee6 <down+6>:       mov    %rdi,%rbp
+0xffffffff90d53ee9 <down+9>:       sub    $0x8,%rsp
+0xffffffff90d53eed <down+13>:      call   0xffffffff916fb560 <_raw_spin_lock_irqsave>
+0xffffffff90d53ef2 <down+18>:      mov    %rax,%rsi
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 58
+0xffffffff90d53ef5 <down+21>:      mov    0x4(%rbp),%eax
+0xffffffff90d53ef8 <down+24>:      test   %eax,%eax
+0xffffffff90d53efa <down+26>:      je     0xffffffff90d53f0f <down+47>
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 59
+0xffffffff90d53efc <down+28>:      sub    $0x1,%eax
+0xffffffff90d53eff <down+31>:      mov    %rbp,%rdi
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 59
+0xffffffff90d53f02 <down+34>:      mov    %eax,0x4(%rbp)
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 62
+0xffffffff90d53f05 <down+37>:      add    $0x8,%rsp
+0xffffffff90d53f09 <down+41>:      pop    %rbp
+0xffffffff90d53f0a <down+42>:      jmp    0xffffffff916fb4e0 <__cpuidle_text_end>
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 61
+0xffffffff90d53f0f <down+47>:      mov    %rbp,%rdi
+0xffffffff90d53f12 <down+50>:      mov    %rsi,(%rsp)
+0xffffffff90d53f16 <down+54>:      call   0xffffffff916f8cc0 <__down>
+0xffffffff90d53f1b <down+59>:      mov    (%rsp),%rsi
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 62
+0xffffffff90d53f1f <down+63>:      mov    %rbp,%rdi
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 63
+0xffffffff90d53f22 <down+66>:      add    $0x8,%rsp
+0xffffffff90d53f26 <down+70>:      pop    %rbp
+0xffffffff90d53f27 <down+71>:      jmp    0xffffffff916fb4e0 <__cpuidle_text_end>
+0xffffffff90d53f2c <down+76>:      nopl   0x0(%rax)
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 76
+0xffffffff90d53f30 <down_interruptible>: nopl 0x0(%rax,%rax,1) [FTRACE NOP]
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 80
+0xffffffff90d53f35 <down_interruptible+5>: push %r12
+0xffffffff90d53f37 <down_interruptible+7>: push %rbp
+```
+
+```
 dis -l __down 40
+```
+
+输出：
+
+```
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 236
+0xffffffff916f8cc0 <__down>:       nopl   0x0(%rax,%rax,1) [FTRACE NOP]
+0xffffffff916f8cc5 <__down+5>:     push   %r12
+0xffffffff916f8cc7 <__down+7>:     mov    %rdi,%r12
+0xffffffff916f8cca <__down+10>:    push   %rbp
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 209
+0xffffffff916f8ccb <__down+11>:    lea    0x8(%rdi),%rbp
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 236
+0xffffffff916f8ccf <__down+15>:    push   %rbx
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../include/linux/list.h: 67
+0xffffffff916f8cd0 <__down+16>:    mov    %rbp,%rdx
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 236
+0xffffffff916f8cd3 <__down+19>:    sub    $0x30,%rsp
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../include/linux/list.h: 100
+0xffffffff916f8cd7 <__down+23>:    mov    0x10(%rdi),%rbx
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 236
+0xffffffff916f8cdb <__down+27>:    mov    %gs:0x28,%rax
+0xffffffff916f8ce4 <__down+36>:    mov    %rax,0x28(%rsp)
+0xffffffff916f8ce9 <__down+41>:    xor    %eax,%eax
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../include/linux/list.h: 67
+0xffffffff916f8ceb <__down+43>:    mov    %rsp,%rdi
+0xffffffff916f8cee <__down+46>:    mov    %rbx,%rsi
+0xffffffff916f8cf1 <__down+49>:    call   0xffffffff91170960 <__list_add_valid>
+0xffffffff916f8cf6 <__down+54>:    test   %al,%al
+0xffffffff916f8cf8 <__down+56>:    je     0xffffffff916f8d0b <__down+75>
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../include/linux/list.h: 70
+0xffffffff916f8cfa <__down+58>:    mov    %rsp,0x10(%r12)
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../include/linux/list.h: 71
+0xffffffff916f8cff <__down+63>:    mov    %rbp,(%rsp)
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../include/linux/list.h: 72
+0xffffffff916f8d03 <__down+67>:    mov    %rbx,0x8(%rsp)
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../include/linux/list.h: 73
+0xffffffff916f8d08 <__down+72>:    mov    %rsp,(%rbx)
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../arch/x86/include/asm/current.h: 15
+0xffffffff916f8d0b <__down+75>:    mov    %gs:0x1f880,%rbx
+0xffffffff916f8d14 <__down+84>:    movabs $0x7fffffffffffffff,%rbp
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 210
+0xffffffff916f8d1e <__down+94>:    mov    %rbx,0x10(%rsp)
+/usr/src/debug/kernel-5.10.0-136.12.0.92.ctl3.x86_64/.../kernel/locking/semaphore.c: 211
+0xffffffff916f8d23 <__down+99>:    movb   $0x0,0x18(%rsp)
 ```
 
 关键发现：`down()` 入口 `mov %rdi,%rbp` 把 `%rbp` 当成普通的 callee-saved 寄存器复用来保存 `sem`（不是常规的帧指针语义），一直保持到调用 `__down` 之后；`__down()` 入口 `push %r12; mov %rdi,%r12; push %rbp; lea 0x8(%rdi),%rbp; push %rbx; sub $0x30,%rsp`——这条 `push %rbp` 压的是**调用者（down）的 `%rbp`**，也就是 `sem` 本身，发生在它被自己改写成 `sem+8`（`&sem->wait_list`）之前。
@@ -265,10 +507,35 @@ bp（sem - 0x20）= ff380114e72ecc40
 kmem ff380114e72ecc40
 ```
 
+输出：
+
+```
+CACHE            OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME
+ff38011c06022600      392     169198    215532   5987   16k  xfs_buf
+  SLAB              MEMORY            NODE  TOTAL  ALLOCATED  FREE
+  ffe7f9c8049cbb00  ff380114e72ec000     0     36         36     0
+  FREE / [ALLOCATED]
+  [ff380114e72ecc40]
+
+      PAGE            PHYSICAL      MAPPING            INDEX CNT FLAGS
+ffe7f9c8049cbb00     1272ec000     ff38011c06022600       0   1  17ffffc0010200 slab,head
+```
+
 结果：`CACHE ff38011c06022600  OBJSIZE 392  NAME xfs_buf`——对象大小跟 `struct -o xfs_buf` 算出的 `SIZE: 392` 完全一致，处于 `[ALLOCATED]`。这次是真的。
 
 ```
 struct xfs_buf.b_bn,b_length,b_flags,b_hold ff380114e72ecc40
+```
+
+输出：
+
+```
+b_bn = 1572864001,
+b_length = 1,
+b_flags = 2097200,
+b_hold = {
+  counter = 4
+},
 ```
 
 结果：`b_bn = 1572864001`、`b_length = 1`、`b_flags = 2097200`、`b_hold.counter = 4`——数值都合理。`b_flags = 2097200` 解码：
@@ -285,10 +552,82 @@ struct xfs_buf.b_bn,b_length,b_flags,b_hold ff380114e72ecc40
 search -t ff380114e72ecc40
 ```
 
+输出：
+
+```
+PID: 3519984  TASK: ff380115fe490000  CPU: 2    COMMAND: "Common"
+ff7ad4f7c9dbd8d8: ff380114e72ecc40
+
+PID: 3519989  TASK: ff380117fc763180  CPU: 5    COMMAND: "Common"
+ff7ad4f7c9c038d8: ff380114e72ecc40
+
+PID: 3520026  TASK: ff3801158200b180  CPU: 1    COMMAND: "SystemLogFlush"
+ff7ad4f7c9d27440: ff380114e72ecc40
+
+PID: 3520043  TASK: ff380115204e0000  CPU: 13   COMMAND: "ThreadPool"
+ff7ad4f7c9f3f2e8: ff380114e72ecc40
+
+PID: 3520048  TASK: ff3801166ef7b180  CPU: 1    COMMAND: "SystemLogFlush"
+ff7ad4f7c9f67440: ff380114e72ecc40
+
+PID: 3520050  TASK: ff380114f607b180  CPU: 3    COMMAND: "ThreadPool"
+ff7ad4f7c9f77690: ff380114e72ecc40
+
+PID: 3520084  TASK: ff38011c01670000  CPU: 1    COMMAND: "ThreadPool"
+ff7ad4f7ccb132e8: ff380114e72ecc40
+
+PID: 3520086  TASK: ff38011ce905b180  CPU: 7    COMMAND: "SystemLogFlush"
+ff7ad4f7ccb23440: ff380114e72ecc40
+
+PID: 3520117  TASK: ff38011e24978000  CPU: 12   COMMAND: "ThreadPool"
+ff7ad4f7ccf3b690: ff380114e72ecc40
+
+PID: 3520130  TASK: ff38011cf3ffb180  CPU: 2    COMMAND: "ThreadPool"
+ff7ad4f7ccfa32e8: ff380114e72ecc40
+
+PID: 3702130  TASK: ff38011cd93eb180  CPU: 13   COMMAND: "kworker/u34:3"
+ff7ad4f7cdcb36b0: ff380114e72ecc40
+
+PID: 3702423  TASK: ff380115e4fe0000  CPU: 2    COMMAND: "kworker/2:0"
+ff7ad4f7cc92f4a0: ff380114e72ecc40
+ff7ad4f7cc92f568: ff380114e72ecc40
+ff7ad4f7cc92f5d8: ff380114e72ecc40
+ff7ad4f7cc92f868: ff380114e72ecc40
+```
+
 结果：命中了十几个任务，包括 `kworker/u34:3` 和一堆 `Common`/`ThreadPool`/`SystemLogFlush`。逐个用 `bt` 核实这些 `ThreadPool`/`Common`/`SystemLogFlush` 命中的完整调用栈，发现清一色是纯用户态 `futex_wait`（8 层：`entry_SYSCALL_64 -> do_syscall_64 -> __se_sys_futex -> do_futex -> futex_wait -> futex_wait_queue_me -> schedule -> __schedule`），跟 XFS 毫无关系，确认是这些线程历史上残留在内核栈里、尚未被覆盖的噪音数据。
 
 ```
 struct xfs_buf.b_sema ff380114e72ecc40
+```
+
+输出：
+
+```
+b_sema = {
+  lock = {
+    raw_lock = {
+      {
+        val = {
+          counter = 0
+        },
+        {
+          locked = 0 '\000',
+          pending = 0 '\000'
+        },
+        {
+          locked_pending = 0,
+          tail = 0
+        }
+      }
+    }
+  },
+  count = 0,
+  wait_list = {
+    next = 0xff7ad4f7cc92f580,
+    prev = 0xff7ad4f7cc92f580
+  }
+},
 ```
 
 结果：`count = 0`（确实锁着），`wait_list.next = wait_list.prev = 0xff7ad4f7cc92f580`——这个地址正好就是第 5 步算出的 `kworker/2:0` 自己 `__down` 帧的 `final_RSP`，即 **wait_list 里只有 `kworker/2:0` 自己一个真实等待者**。这也纠正了此前的一个猜测：`kworker/u34:3` 栈里出现的同一个地址，其实是它**更早、已经用完并释放**的一次 AGF 访问留下的残留数据（对应 dmesg 里那几个带 `?` 号的旧帧），不是它当前真正等待的对象。
@@ -299,11 +638,104 @@ struct xfs_buf.b_sema ff380114e72ecc40
 struct xfs_buf.b_pag,b_bn ff380114e72ecc40
 ```
 
+输出：
+
+```
+b_pag = 0xff38011c00dd7000,
+b_bn = 1572864001,
+```
+
 结果：`b_pag = 0xff38011c00dd7000`（这正是第 4 步误判的那个地址，真相大白：它是一个 `xfs_perag`，不是 `xfs_buf`）。`pag_agno = 1`，确认是 **AG #1**。
 
 ```
 struct -o xfs_perag
+```
+
+输出：
+
+```
+struct xfs_perag {
+    [0] struct xfs_mount *pag_mount;
+    [8] xfs_agnumber_t pag_agno;
+   [12] atomic_t pag_ref;
+   [16] char pagf_init;
+   [17] char pagi_init;
+   [18] char pagf_metadata;
+   [19] char pagi_inodeok;
+   [20] uint8_t pagf_levels[3];
+   [23] bool pagf_agflreset;
+   [24] uint32_t pagf_flcount;
+   [28] xfs_extlen_t pagf_freeblks;
+   [32] xfs_extlen_t pagf_longest;
+   [36] uint32_t pagf_btreeblks;
+   [40] xfs_agino_t pagi_freecount;
+   [44] xfs_agino_t pagi_count;
+   [48] xfs_agino_t pagl_pagino;
+   [52] xfs_agino_t pagl_leftrec;
+   [56] xfs_agino_t pagl_rightrec;
+   [60] uint16_t pag_checked;
+   [62] uint16_t pag_sick;
+   [64] spinlock_t pag_state_lock;
+   [68] spinlock_t pagb_lock;
+   [72] struct rb_root pagb_tree;
+   [80] unsigned int pagb_gen;
+   [88] wait_queue_head_t pagb_wait;
+  [112] atomic_t pagf_fstrms;
+  [116] spinlock_t pag_ici_lock;
+  [120] struct xarray pag_ici_root;
+  [136] int pag_ici_reclaimable;
+  [144] unsigned long pag_ici_reclaim_cursor;
+  [152] spinlock_t pag_buf_lock;
+  [160] struct rhashtable pag_buf_hash;
+  [328] struct callback_head callback_head;
+  [344] int pagb_count;
+  [348] struct xfs_ag_resv pag_meta_resv;
+  [360] struct xfs_ag_resv pag_rmapbt_resv;
+  [376] struct delayed_work pag_blockgc_work;
+  [568] uint8_t pagf_refcount_level;
+  [576] struct rhashtable pagi_unlinked_hash;
+}
+```
+
+```
 struct xfs_perag.pag_agno,pagf_freeblks,pagf_longest,pagf_flcount,pagf_btreeblks,pagi_freecount,pagi_count,pagb_lock,pagb_tree,pagb_count ff38011c00dd7000
+```
+
+输出：
+
+```
+pag_agno = 1,
+pagf_freeblks = 63802947,
+pagf_longest = 27701546,
+pagf_flcount = 6,
+pagf_btreeblks = 52,
+pagi_freecount = 25752,
+pagi_count = 653632,
+pagb_lock = {
+  {
+    rlock = {
+      raw_lock = {
+        {
+          val = {
+            counter = 0
+          },
+          {
+            locked = 0 '\000',
+            pending = 0 '\000'
+          },
+          {
+            locked_pending = 0,
+            tail = 0
+          }
+        }
+      }
+    }
+  }
+},
+pagb_tree = {
+  rb_node = 0x0
+},
+pagb_count = 0,
 ```
 
 结果逐一核对四个常见假设：
@@ -311,7 +743,36 @@ struct xfs_perag.pag_agno,pagf_freeblks,pagf_longest,pagf_flcount,pagf_btreeblks
 1. **AG 空间不足**：`pagf_freeblks`/`pagf_longest` 换算下来空闲空间是几百 GB 量级，排除。
 2. **忙碌区间（busy extent）等日志刷盘**：`pagb_tree = { rb_node = 0x0 }`，`pagb_count = 0`，`pagb_lock` 未上锁，排除。
 3. **日志子系统本身卡住**：在 `foreach_bt_f.txt` 全量数据里搜索 `xlog_*`/`xfs_log_*`，零命中，排除。
-4. **文件系统已经 shutdown/损坏**：`log -T | grep -iE "xfs|corrupt|shutdown|Internal error|Metadata I/O error"` 没有任何相关记录，排除。
+4. **文件系统已经 shutdown/损坏**：
+
+   ```
+   log -T | grep -iE "xfs|corrupt|shutdown|Internal error|Metadata I/O error"
+   ```
+
+   输出：
+
+   ```
+   [Tue Sep  9 14:21:06 CST 2025] SGI XFS with ACLs, security attributes, quota, no debug enabled
+   [Tue Sep  9 14:21:06 CST 2025] XFS (vda1): EXPERIMENTAL big timestamp feature in use. Use at your own risk!
+   [Tue Sep  9 14:21:06 CST 2025] XFS (vda1): EXPERIMENTAL inode btree counters feature in use. Use at your own risk!
+   [Tue Sep  9 14:21:06 CST 2025] XFS (vda1): Mounting V5 Filesystem
+   [Tue Sep  9 14:21:06 CST 2025] XFS (vda1): Ending clean mount
+   [Tue Sep  9 14:26:41 CST 2025] XFS (vdb): EXPERIMENTAL big timestamp feature in use. Use at your own risk!
+   [Tue Sep  9 14:26:41 CST 2025] XFS (vdb): EXPERIMENTAL inode btree counters feature in use. Use at your own risk!
+   [Tue Sep  9 14:26:41 CST 2025] XFS (vdb): Mounting V5 Filesystem
+   [Tue Sep  9 14:26:41 CST 2025] XFS (vdb): Ending clean mount
+   [Thu Dec 25 17:58:24 CST 2025]   __xfs_filemap_fault+0x144/0x240 [xfs]
+   [Tue Jul 21 15:11:01 CST 2026]  xfs_inodegc_flush.part.0+0x3e/0x90 [xfs]
+   [Tue Jul 21 15:11:01 CST 2026]  xfs_fs_statfs+0x2d/0x1a0 [xfs]
+   [Tue Jul 21 15:11:01 CST 2026]  xfs_inodegc_flush.part.0+0x3e/0x90 [xfs]
+   [Tue Jul 21 15:11:01 CST 2026]  xfs_fs_statfs+0x2d/0x1a0 [xfs]
+   [Tue Jul 21 15:11:01 CST 2026]  xfs_inodegc_flush.part.0+0x3e/0x90 [xfs]
+   [Tue Jul 21 15:11:01 CST 2026]  xfs_fs_statfs+0x2d/0x1a0 [xfs]
+   [Tue Jul 21 15:11:01 CST 2026]  ? xfs_buf_read_map+0x54/0x280 [xfs]
+   [Tue Jul 21 15:11:01 CST 2026]  ? xfs_btree_read_buf_block.constprop.0+0x9d/0xe0 [xfs]
+   ```
+
+   没有任何 `Internal error`/`Corruption`/`shutdown` 记录，只有正常挂载信息和已经分析过的 hung_task 调用栈摘要，排除。
 
 ### 第 9 步：不甘心止步于"未解之谜"，换角度扩大搜索——挖到 AGI 也卡住了
 
@@ -332,9 +793,68 @@ bp（sem - 0x20）= ff380114e72eca80
 
 ```
 kmem ff380114e72eca80
-struct xfs_buf ff380114e72eca80
+```
+
+输出：
+
+```
+CACHE            OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME
+ff38011c06022600      392     169198    215532   5987   16k  xfs_buf
+  SLAB              MEMORY            NODE  TOTAL  ALLOCATED  FREE
+  ffe7f9c8049cbb00  ff380114e72ec000     0     36         36     0
+  FREE / [ALLOCATED]
+  [ff380114e72eca80]
+
+      PAGE            PHYSICAL      MAPPING            INDEX CNT FLAGS
+ffe7f9c8049cbb00     1272ec000     ff38011c06022600       0   1  17ffffc0010200 slab,head
+```
+
+```
 struct xfs_buf.b_sema ff380114e72eca80
+```
+
+输出：
+
+```
+b_sema = {
+  lock = {
+    raw_lock = {
+      {
+        val = {
+          counter = 0
+        },
+        {
+          locked = 0 '\000',
+          pending = 0 '\000'
+        },
+        {
+          locked_pending = 0,
+          tail = 0
+        }
+      }
+    }
+  },
+  count = 0,
+  wait_list = {
+    next = 0xff7ad4f7cd9237c0,
+    prev = 0xff7ad4f7cd9237c0
+  }
+},
+```
+
+```
 struct xfs_buf.b_pag,b_bn,b_flags,b_hold ff380114e72eca80
+```
+
+输出：
+
+```
+b_pag = 0xff38011c00dd7000,
+b_bn = 1572864002,
+b_flags = 2097200,
+b_hold = {
+  counter = 4
+},
 ```
 
 结果：跟 AGF buffer 同一个 slab 页分配出来的；`b_pag` 完全相同（同一个 AG#1）；`b_bn = 1572864002`，跟 AGF 的 `b_bn = 1572864001` **正好相邻**——对应 XFS 一个 AG 最前面几个块的标准布局（块0=superblock，块1=AGF，块2=AGI），确认是 **AG#1 的 AGI buffer**；`b_flags`/`b_hold` 跟 AGF buffer 完全一样（同样 `XBF_DONE` 已完成但锁未释放）；`b_sema.wait_list` 同样只有 `HTTPHandler` 自己一个真实等待者。
@@ -347,18 +867,114 @@ struct xfs_buf.b_pag,b_bn,b_flags,b_hold ff380114e72eca80
 struct xfs_buf.b_transp,b_log_item,b_pin_count ff380114e72ecc40
 ```
 
+输出：
+
+```
+b_transp = 0xff38011cb6802bc8,
+b_log_item = 0xff3801162b48c840,
+b_pin_count = {
+  counter = 0
+},
+```
+
 AGF buffer 结果：`b_transp = 0xff38011cb6802bc8`（非空，确实挂在一个活跃事务上）。顺着事务往下挖：
 
 ```
 struct -o xfs_trans
+```
+
+输出：
+
+```
+struct xfs_trans {
+    [0] unsigned int t_magic;
+    [4] unsigned int t_log_res;
+    [8] unsigned int t_log_count;
+   [12] unsigned int t_blk_res;
+   [16] unsigned int t_blk_res_used;
+   [20] unsigned int t_rtx_res;
+   [24] unsigned int t_rtx_res_used;
+   [28] unsigned int t_flags;
+   [32] xfs_fsblock_t t_firstblock;
+   [40] struct xlog_ticket *t_ticket;
+   [48] struct xfs_mount *t_mountp;
+   [56] struct xfs_dquot_acct *t_dqinfo;
+   [64] int64_t t_icount_delta;
+   [72] int64_t t_ifree_delta;
+   [80] int64_t t_fdblocks_delta;
+   [88] int64_t t_res_fdblocks_delta;
+   [96] int64_t t_frextents_delta;
+  [104] int64_t t_res_frextents_delta;
+  [112] int64_t t_dblocks_delta;
+  [120] int64_t t_agcount_delta;
+  [128] int64_t t_imaxpct_delta;
+  [136] int64_t t_rextsize_delta;
+  [144] int64_t t_rbmblocks_delta;
+  [152] int64_t t_rblocks_delta;
+  [160] int64_t t_rextents_delta;
+  [168] int64_t t_rextslog_delta;
+  [176] struct list_head t_items;
+  [192] struct list_head t_busy;
+  [208] struct list_head t_dfops;
+  [224] unsigned long t_pflags;
+}
+SIZE: 232
+```
+
+```
 struct xfs_trans.t_ticket,t_mountp,t_flags,t_log_res,t_log_count ff38011cb6802bc8
+```
+
+输出：
+
+```
+t_ticket = 0xff38011e5c275b50,
+t_mountp = 0xff38011c02e36000,
+t_flags = 37,
+t_log_res = 201976,
+t_log_count = 8,
 ```
 
 拿到 `t_ticket = 0xff38011e5c275b50`。再往下：
 
 ```
 struct -o xlog_ticket
+```
+
+输出：
+
+```
+struct xlog_ticket {
+    [0] struct list_head t_queue;
+   [16] struct task_struct *t_task;
+   [24] xlog_tid_t t_tid;
+   [28] atomic_t t_ref;
+   [32] int t_curr_res;
+   [36] int t_unit_res;
+   [40] char t_ocnt;
+   [41] char t_cnt;
+   [42] char t_clientid;
+   [43] char t_flags;
+   [44] uint t_res_num;
+   [48] uint t_res_num_ophdrs;
+   [52] uint t_res_arr_sum;
+   [56] uint t_res_o_flow;
+   [60] xlog_res_t t_res_arr[15];
+}
+SIZE: 184
+```
+
+```
 struct xlog_ticket.t_task,t_tid,t_curr_res,t_unit_res ff38011e5c275b50
+```
+
+输出：
+
+```
+t_task = 0xff38011cd93eb180,
+t_tid = 1468600922,
+t_curr_res = 207220,
+t_unit_res = 207220,
 ```
 
 **结果：`t_task = 0xff38011cd93eb180`——这正是 `kworker/u34:3`（writeback）自己的 `task_struct` 地址！**
@@ -369,8 +985,34 @@ struct xlog_ticket.t_task,t_tid,t_curr_res,t_unit_res ff38011e5c275b50
 
 ```
 struct xfs_buf.b_transp,b_bn,b_pag ff380117743ac540
+```
+
+输出：
+
+```
+b_transp = 0xff38011e7fa9e9f8,
+b_bn = 1577999968,
+b_pag = 0xff38011c00dd7000,
+```
+
+```
 struct xfs_trans.t_ticket ff38011e7fa9e9f8
+```
+
+输出：
+
+```
+t_ticket = 0xff38011c8265a5c0,
+```
+
+```
 struct xlog_ticket.t_task ff38011c8265a5c0
+```
+
+输出：
+
+```
+t_task = 0xff380115e4fe0000,
 ```
 
 **结果：`t_task = 0xff380115e4fe0000`——这正是 `kworker/2:0` 自己的 `task_struct`！**
@@ -379,6 +1021,12 @@ struct xlog_ticket.t_task ff38011c8265a5c0
 
 ```
 struct xfs_buf.b_transp ff380114e72eca80
+```
+
+输出：
+
+```
+b_transp = 0xff38011e7fa9e9f8,
 ```
 
 **结果：`0xff38011e7fa9e9f8`——跟 `kworker/u34:3` 卡住的那块 inode cluster buffer 的事务地址完全相同**，证实 AGI 和这块 inode cluster buffer确实是被 `kworker/2:0` 的**同一个事务**同时锁着。
