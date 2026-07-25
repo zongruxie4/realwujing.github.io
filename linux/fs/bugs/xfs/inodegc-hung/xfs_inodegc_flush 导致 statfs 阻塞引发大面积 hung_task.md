@@ -2,12 +2,25 @@
 
 ## 环境信息
 
+本文实际涉及**两台独立主机**的两次独立故障（命中同一处内核代码，但不是同一次事件），证据完整度不一样，先在这里列清楚，避免正文和附录混着看的时候搞混：
+
+| | 主机 1（本文正文分析对象） | 主机 2（附录：长沙42-os） |
+|---|---|---|
+| 资源池 | 华东1 资源池 | 长沙42-os |
+| 主机 ID | `bef9d276-d2af-7729-90e9-939b` | IP `43.65.3.106`，主机 uuid `ae25d315-e9e3-4800-3069-1b9aff4a5d04` |
+| 故障时间 | 2026-07-21 15:11–15:13 | 2026-07-21 08:20–09:37 |
+| **现有证据** | `dmesg.click.7.21.1.log` **+ vmcore**（已用 `crash` 复核，坐实 ABBA 死锁） | 仅 `messages-20260724` 日志，**没有 vmcore**，结论止步于 dmesg 级别推断 |
+
+以下环境细节针对**主机 1**（正文的主要分析对象）：
+
 - 磁盘故障处理，华东1 资源池
 - 主机ID：bef9d276-d2af-7729-90e9-939b
 - 内核版本：`5.10.0-136.12.0.92.ctl3.x86_64`
 - Hypervisor：KVM（`GoStack Foundation OpenStack Nova`）
 - 故障磁盘：`vdb`，virtio-blk，6291456000 个 512 字节逻辑块（3.22 TB / 2.93 TiB），XFS V5 文件系统
 - 系统盘 `vda1` 同为 XFS，未受影响
+
+主机 2 的环境信息见后面「附：同一处代码在另一台主机（长沙42-os）上的独立复现」一节的故障通报原文。
 
 ## 问题现象
 
@@ -155,7 +168,9 @@ Call Trace:
 
 ## 根因分析
 
-两个内核工作线程都不是"死锁"在 CPU 上打转，而是在等 **buffer 信号量**（`xfs_buf_lock`），本质上是在等一次 buffer I/O（读盘）完成或等持锁者释放锁：
+> **本节结论已被后面「vmcore 复核」一节的实测数据推翻，保留在此仅作为"仅凭 dmesg 能得出的初步判断"的记录，实际根因见下面的更新版本。**
+
+两个内核工作线程最初看起来都不是"死锁"在 CPU 上打转，而是在等 **buffer 信号量**（`xfs_buf_lock`），dmesg 层面无法判断是等一次 buffer I/O（读盘）完成，还是等持锁者释放锁：
 
 ```
 用户态 statfs 一堆进程
@@ -167,20 +182,320 @@ xfs-inodegc/vdb worker（卡在 AGF buffer 锁 / down()）
 writeback (flush-253:16) worker（卡在 inode cluster buffer 锁 / down()）
                                   │
                                   ▼
-                          vdb 磁盘 I/O 长时间未完成
+                          vdb 磁盘 I/O 长时间未完成 ← 这一步是错的，见下文
 ```
 
-两个 worker 各自等待的是**不同的 buffer**（一个是 AGF，一个是 inode cluster），日志里没有证据显示是 XFS 内部的 ABBA 死锁；更符合"底层 `vdb`（virtio-blk 云盘）在这几分钟内 I/O 迟迟不返回"这一现象——buffer 锁在发起 I/O 的线程一直持有到 I/O completion callback 里才释放，如果磁盘慢/丢中断/后端抖动，锁自然长时间不释放。
+（**已订正**：拿到 vmcore 之后用 `crash` 核实，两个 worker 卡的确实是各自不同的 buffer——`xfs-inodegc/vdb` 卡在 **AGF**，`writeback` 卡在一块 **inode cluster buffer**——但两者并不是分别独立等磁盘 I/O，而是构成了一个**真实的 ABBA 循环死锁**：详见「vmcore 复核」一节，用 `b_transp -> t_ticket -> t_task` 这条内核自身维护的关联关系完整验证过。）
 
-真正让故障"扩散"的是 XFS 的一个设计点：`xfs_fs_statfs()` 在返回 df/statfs 结果前会调用 `xfs_inodegc_flush()` 等待 inodegc 全部跑完，以保证空闲块/inode 计数准确。这本是为了拿到精确结果，但代价是：**只要 inodegc worker 因为任何原因（包括单纯的磁盘慢）被卡住，所有调用 statfs/statvfs 的进程都会被一起挂起**，包括各类监控 agent（`node_exporter`、`telegraf`、`titanagent` 等定时采集磁盘使用率的组件），造成"一次局部 I/O 卡顿"被放大成"大面积业务进程 D 状态"的假象。
+真正让故障"扩散"的是 XFS 的一个设计点：`xfs_fs_statfs()` 在返回 df/statfs 结果前会调用 `xfs_inodegc_flush()` 等待 inodegc 全部跑完，以保证空闲块/inode 计数准确。这本是为了拿到精确结果，但代价是：**只要 inodegc worker 因为任何原因（包括真死锁）被卡住，所有调用 statfs/statvfs 的进程都会被一起挂起**，包括各类监控 agent（`node_exporter`、`telegraf`、`titanagent` 等定时采集磁盘使用率的组件），造成"一次内核态死锁"被放大成"大面积业务进程 D 状态"。
 
-## 结论
+## vmcore 复核：完整排查过程与最终结论
 
-1. 触发点大概率是 `vdb`（华东1 资源池、主机 `bef9d276-d2af-7729-90e9-939b`）后端存储/虚拟化层出现短暂 I/O 停顿或抖动，属于磁盘故障范畴，而非 XFS 自身死锁。
-2. `xfs-inodegc` 与 `writeback` 两个 worker 卡在各自的 `xfs_buf_lock` 上，是在等对应 buffer 的 I/O 完成，未见 ABBA 循环等待。
-3. 监控/agent 进程大量 D 状态是 `xfs_fs_statfs -> xfs_inodegc_flush -> flush_work` 这条路径的放大效应，只要 inodegc worker 恢复，statfs 调用方会一起解除阻塞，不需要单独处理。
+拿到了这台故障机（`bef9d276-d2af-7729-90e9-939b`）对应的 vmcore 之后，用 `crash 8.0.2` + 匹配的 `vmlinux`/`xfs.ko` debuginfo 做了进一步排查。这一节把每一步实际跑过的 `crash` 命令、拿到的结果、以及每一步的推理都完整记录下来（包括走过的弯路和中途的误判），最终坐实了一个此前基于 dmesg 分析不出来的结论：**这是一个真实的 ABBA 循环死锁，不是等磁盘慢 I/O**。
 
-**局限性说明**：本次只拿到了全量 dmesg，没有 vmcore。dmesg 里能看到的只是"卡在 `xfs_buf_lock` 的 `down()` 上"，看不到这块 buffer 当时的持锁者是谁、在做什么——上面"未见 ABBA 循环等待"的结论只是"没有证据支持死锁"，不等于"证明了不是死锁"。如果后续同类故障能拿到 vmcore，应该用 crash 工具进一步确认持锁上下文，才能把这个结论坐实。
+### 环境准备
+
+vmcore 是在 host 上用 `virsh qemu-monitor-command --hmp <vm> "dump-guest-memory -z /path/to/xxx.img"` 导出的（`-z` = kdump 压缩格式，zlib 压缩，不是标准 ELF，`file` 认不出来、`makedumpfile` 也不能直接处理，但 `crash` 能原生识别）。用到的 debuginfo：
+
+- 内核本体：`/usr/lib/debug/lib/modules/5.10.0-136.12.0.92.ctl3.x86_64/vmlinux`
+- `xfs.ko` 模块符号：机器上的 `/lib/modules/.../kernel/fs/xfs/xfs.ko.xz` 是压缩过的裸模块，没有调试符号；真正带 DWARF 调试信息的是 `/lib/debug/lib/modules/.../kernel/fs/xfs/xfs.ko-5.10.0-136.12.0.92.ctl3.x86_64.debug`（35MB，比裸 `.ko` 大得多），用 `mod -s xfs <这个 .debug 文件>` 加载。
+
+### 第 1 步：`ps | grep UN` —— D 状态任务的真实规模比 dmesg 大得多
+
+结果：dump 时刻共有 **286 个**处于 D 状态的任务，远多于 dmesg 里能看到的 10 条告警——印证了前面「`hung_task_warnings` 到底是不是 10」那一节的判断：dmesg 只是打满额度后被静默截断的一角。除了 dmesg 里已知的 `kworker/2:0`（xfs-inodegc，PID 3702423）、`kworker/u34:3`（writeback，PID 3702130）、`telegraf`、`19100_node_expo`、`titanagent`，还包括：
+
+- `[xfsaild/vdb]`（AIL 推送线程，PID 5062）——后续 `bt -f 5062` 核实发现它只是在正常的周期性 `schedule_timeout` 休眠里（XFS 用 `TASK_KILLABLE` 休眠，`ps` 会显示成 D 状态），栈里没有任何 `xfs_buf_lock`/`down`，并没有真的卡在 buffer 锁上，属于误报，排除。
+- 大量该主机上某 Java 进程（父 PID 3519292）的 `HTTPHandler`/`BgSchPool`/`AsyncMetrics` 线程，以及一批 `(ostnamed)`、`df`、`ls`。
+
+### 第 2 步：`bt -a -f` —— dump 时刻系统是完全静止的
+
+结果：全部 16 个 CPU 都停在 `swapper/N` 的 `default_idle`，没有任何一个 CPU 正在处理 I/O 完成或跑软中断。说明持锁的上下文此刻也必然是睡眠状态，不在任何 CPU 上运行。
+
+### 第 3 步：`foreach bt -f UN` —— 拿到全部 D 状态任务的调用栈 + 原始栈数据
+
+一次性把 286 个 D 状态任务的调用栈和栈帧原始内存都导出来（后来发现 `foreach bt -f`不加过滤条件产出的文件跟 `foreach bt -f UN` 完全一致，说明这台机器上睡眠中的任务，含用户态 futex 等待，实际有近三千个，`UN` 过滤在这次操作里没生效，等于是全量数据）。
+
+### 第 4 步：第一次尝试定位 `xfs_buf`（猜错了，记录下来避免同样的坑）
+
+肉眼在 `kworker/2:0` 和 `kworker/u34:3` 各自的 `__down`/`down`/`xfs_buf_lock` 栈帧原始数据里，找到一对两边都出现的地址，凭直觉猜测 `bp = ff38011c00dd7000`：
+
+```
+struct xfs_buf ff38011c00dd7000
+```
+
+结果：`b_hold.counter = 514`、`b_flags = 63802947`、`b_sema.wait_list.next = 0x9f94000006498` 等字段全是明显不合理的爆炸值。
+
+```
+kmem ff38011c00dd7000
+```
+
+结果：这个地址属于通用 `kmalloc-1k` 缓存，不是 XFS 专用的 buffer slab——说明地址本身是个合法对象，但**类型猜错了**（不是 `xfs_buf`）。这个地址后来在第 8 步查明其实是 `xfs_perag`（AGI/AGF 所在 AG 的元数据结构），只是这一步误当成 `xfs_buf` 去解析，字段全部错位导致看起来像垃圾值。
+
+### 第 5 步：改用反汇编精确计算，不再肉眼猜
+
+先拿真实的字段偏移：
+
+```
+struct -o xfs_buf
+```
+
+结果：`b_sema` 在偏移 **0x20**，不是第 4 步瞎猜时以为的 `0x98`（`0x98` 其实是 `b_addr` 字段的偏移）。
+
+再反汇编 `down()`/`__down()`，精确搞清楚 `sem` 参数在栈上/寄存器里的传递路径：
+
+```
+dis -l down 30
+dis -l __down 40
+```
+
+关键发现：`down()` 入口 `mov %rdi,%rbp` 把 `%rbp` 当成普通的 callee-saved 寄存器复用来保存 `sem`（不是常规的帧指针语义），一直保持到调用 `__down` 之后；`__down()` 入口 `push %r12; mov %rdi,%r12; push %rbp; lea 0x8(%rdi),%rbp; push %rbx; sub $0x30,%rsp`——这条 `push %rbp` 压的是**调用者（down）的 `%rbp`**，也就是 `sem` 本身，发生在它被自己改写成 `sem+8`（`&sem->wait_list`）之前。
+
+用 `#4 down at ffffffff90d53f1b` 这个已知的返回地址反推 `__down` 帧的 `final_RSP = 返回地址位置 - 0x48`（3 次 push + `sub $0x30`），再从 `final_RSP + 0x38` 读出压栈保存的 `sem`。对 `kworker/2:0` 算出：
+
+```
+sem = ff380114e72ecc60
+bp（sem - 0x20）= ff380114e72ecc40
+```
+
+交叉验证：`down()` 自己那一帧（调用者 `xfs_buf_lock` 的 `bp` 局部变量，作为"调用者的旧 rbp"被压在 `down` 帧里）里原样出现了 `ff380114e72ecc40`，跟反推结果完全对上。
+
+### 第 6 步：验证新地址是真的
+
+```
+kmem ff380114e72ecc40
+```
+
+结果：`CACHE ff38011c06022600  OBJSIZE 392  NAME xfs_buf`——对象大小跟 `struct -o xfs_buf` 算出的 `SIZE: 392` 完全一致，处于 `[ALLOCATED]`。这次是真的。
+
+```
+struct xfs_buf.b_bn,b_length,b_flags,b_hold ff380114e72ecc40
+```
+
+结果：`b_bn = 1572864001`、`b_length = 1`、`b_flags = 2097200`、`b_hold.counter = 4`——数值都合理。`b_flags = 2097200` 解码：
+
+```
+2097200 = _XBF_KMEM(1<<21) | XBF_DONE(1<<5) | XBF_ASYNC(1<<4)
+```
+
+**`XBF_DONE` 已置位——这块 buffer 的 I/O 早就完成了**，不是还在等磁盘返回；问题变成"I/O 已经做完，但锁一直没被释放，持锁的上下文卡在哪"。
+
+### 第 7 步：`search -t` + `b_sema` —— 纠正一处中途误判
+
+```
+search -t ff380114e72ecc40
+```
+
+结果：命中了十几个任务，包括 `kworker/u34:3` 和一堆 `Common`/`ThreadPool`/`SystemLogFlush`。逐个用 `bt` 核实这些 `ThreadPool`/`Common`/`SystemLogFlush` 命中的完整调用栈，发现清一色是纯用户态 `futex_wait`（8 层：`entry_SYSCALL_64 -> do_syscall_64 -> __se_sys_futex -> do_futex -> futex_wait -> futex_wait_queue_me -> schedule -> __schedule`），跟 XFS 毫无关系，确认是这些线程历史上残留在内核栈里、尚未被覆盖的噪音数据。
+
+```
+struct xfs_buf.b_sema ff380114e72ecc40
+```
+
+结果：`count = 0`（确实锁着），`wait_list.next = wait_list.prev = 0xff7ad4f7cc92f580`——这个地址正好就是第 5 步算出的 `kworker/2:0` 自己 `__down` 帧的 `final_RSP`，即 **wait_list 里只有 `kworker/2:0` 自己一个真实等待者**。这也纠正了此前的一个猜测：`kworker/u34:3` 栈里出现的同一个地址，其实是它**更早、已经用完并释放**的一次 AGF 访问留下的残留数据（对应 dmesg 里那几个带 `?` 号的旧帧），不是它当前真正等待的对象。
+
+### 第 8 步：`b_pag` + `struct -o xfs_perag` —— 排除四个假设
+
+```
+struct xfs_buf.b_pag,b_bn ff380114e72ecc40
+```
+
+结果：`b_pag = 0xff38011c00dd7000`（这正是第 4 步误判的那个地址，真相大白：它是一个 `xfs_perag`，不是 `xfs_buf`）。`pag_agno = 1`，确认是 **AG #1**。
+
+```
+struct -o xfs_perag
+struct xfs_perag.pag_agno,pagf_freeblks,pagf_longest,pagf_flcount,pagf_btreeblks,pagi_freecount,pagi_count,pagb_lock,pagb_tree,pagb_count ff38011c00dd7000
+```
+
+结果逐一核对四个常见假设：
+
+1. **AG 空间不足**：`pagf_freeblks`/`pagf_longest` 换算下来空闲空间是几百 GB 量级，排除。
+2. **忙碌区间（busy extent）等日志刷盘**：`pagb_tree = { rb_node = 0x0 }`，`pagb_count = 0`，`pagb_lock` 未上锁，排除。
+3. **日志子系统本身卡住**：在 `foreach_bt_f.txt` 全量数据里搜索 `xlog_*`/`xfs_log_*`，零命中，排除。
+4. **文件系统已经 shutdown/损坏**：`log -T | grep -iE "xfs|corrupt|shutdown|Internal error|Metadata I/O error"` 没有任何相关记录，排除。
+
+### 第 9 步：不甘心止步于"未解之谜"，换角度扩大搜索——挖到 AGI 也卡住了
+
+不再依赖地址搜索，直接在 `foreach bt -f` 全量数据里搜"当前调用栈里还挂着 `xfs_alloc`/`xfs_trans`/`xfs_buf`/`xfs_bmap`/`xfs_difree`/`xfs_btree` 相关函数"的任务：
+
+```
+awk '/^PID:/{...} 函数名匹配 xfs_alloc|xfs_trans|xfs_buf|xfs_bmap|xfs_ialloc|xfs_difree|xfs_btree' foreach_bt_f.txt
+```
+
+挖到一个漏网的：**`HTTPHandler`（PID 3686288）**，调用链是 `openat()` 建新文件 -> `xfs_create -> xfs_dir_ialloc -> xfs_ialloc -> xfs_dialloc -> xfs_ialloc_read_agi -> xfs_read_agi -> xfs_trans_read_buf_map -> xfs_buf_read_map -> xfs_buf_get_map -> xfs_buf_find -> xfs_buf_lock -> down()`，同样卡死。
+
+用第 5 步同一套反汇编方法，对 `HTTPHandler` 算出：
+
+```
+sem = ff380114e72ecaa0
+bp（sem - 0x20）= ff380114e72eca80
+```
+
+```
+kmem ff380114e72eca80
+struct xfs_buf ff380114e72eca80
+struct xfs_buf.b_sema ff380114e72eca80
+struct xfs_buf.b_pag,b_bn,b_flags,b_hold ff380114e72eca80
+```
+
+结果：跟 AGF buffer 同一个 slab 页分配出来的；`b_pag` 完全相同（同一个 AG#1）；`b_bn = 1572864002`，跟 AGF 的 `b_bn = 1572864001` **正好相邻**——对应 XFS 一个 AG 最前面几个块的标准布局（块0=superblock，块1=AGF，块2=AGI），确认是 **AG#1 的 AGI buffer**；`b_flags`/`b_hold` 跟 AGF buffer 完全一样（同样 `XBF_DONE` 已完成但锁未释放）；`b_sema.wait_list` 同样只有 `HTTPHandler` 自己一个真实等待者。
+
+### 第 10 步：换用 `b_transp` 直接找持锁事务，不再靠猜——真相大白
+
+裸信号量不记录持有者，但 XFS 的 buffer 一旦被读进一个事务会一直标记着，`struct -o xfs_buf` 里 `[280] struct xfs_trans *b_transp` 这个字段能直接带我们找到持有它的事务：
+
+```
+struct xfs_buf.b_transp,b_log_item,b_pin_count ff380114e72ecc40
+```
+
+AGF buffer 结果：`b_transp = 0xff38011cb6802bc8`（非空，确实挂在一个活跃事务上）。顺着事务往下挖：
+
+```
+struct -o xfs_trans
+struct xfs_trans.t_ticket,t_mountp,t_flags,t_log_res,t_log_count ff38011cb6802bc8
+```
+
+拿到 `t_ticket = 0xff38011e5c275b50`。再往下：
+
+```
+struct -o xlog_ticket
+struct xlog_ticket.t_task,t_tid,t_curr_res,t_unit_res ff38011e5c275b50
+```
+
+**结果：`t_task = 0xff38011cd93eb180`——这正是 `kworker/u34:3`（writeback）自己的 `task_struct` 地址！**
+
+也就是说：**AGF buffer 的事务持有者是 `kworker/u34:3`，不是此前猜测的 `kworker/2:0`**——`kworker/u34:3` 在自己的 `xfs_bmap_btalloc` 里先用 AGF 成功分配过一次 extent（dmesg 里那几个带 `?` 号的旧帧 `xfs_alloc_vextent`/`xfs_alloc_ag_vextent` 其实是真实发生过、仍在生效的操作，不是纯垃圾残留），然后往下走到 `xfs_imap_to_bp` 找 inode cluster buffer 时自己也卡住了，事务不提交，AGF 就一直锁着。
+
+反过来查 `kworker/u34:3` 自己当前卡住的 buffer（用同一套反汇编方法算出 `bp = ff380117743ac540`）：
+
+```
+struct xfs_buf.b_transp,b_bn,b_pag ff380117743ac540
+struct xfs_trans.t_ticket ff38011e7fa9e9f8
+struct xlog_ticket.t_task ff38011c8265a5c0
+```
+
+**结果：`t_task = 0xff380115e4fe0000`——这正是 `kworker/2:0` 自己的 `task_struct`！**
+
+最后交叉验证：AGI buffer 的 `b_transp` 是不是也指向 `kworker/2:0` 的同一个事务：
+
+```
+struct xfs_buf.b_transp ff380114e72eca80
+```
+
+**结果：`0xff38011e7fa9e9f8`——跟 `kworker/u34:3` 卡住的那块 inode cluster buffer 的事务地址完全相同**，证实 AGI 和这块 inode cluster buffer确实是被 `kworker/2:0` 的**同一个事务**同时锁着。
+
+### 最终结论：坐实的 ABBA 循环死锁
+
+```
+kworker/2:0（释放某个 inode）的事务：
+    持有 AGI + 持有该 inode 所在的 inode cluster buffer
+    -> 还需要 AGF（finobt 分裂）-> 卡住（AGF 被 kworker/u34:3 的事务攥着）
+
+kworker/u34:3（回写另一个 inode，可能与上面共享同一个 cluster）的事务：
+    持有 AGF（延迟分配转换时用它分配过 extent，事务未提交）
+    -> 还需要 inode cluster buffer（写回该 inode）-> 卡住（被 kworker/2:0 的事务攥着）
+```
+
+`kworker/2:0` 持有 A（AGI + inode cluster）要 B（AGF），`kworker/u34:3` 持有 B（AGF）要 A（inode cluster）——**这是一个可以用 `b_transp -> t_ticket -> t_task` 内核自身维护的关联关系完整验证的 ABBA 循环死锁，不是等磁盘慢 I/O**。这直接推翻了正文「根因分析」「结论」里"未见 ABBA 死锁证据，更符合等 I/O 完成"的判断，那两节需要连同后面"这批补丁能不能彻底解决 D 状态问题"的评估一起重写。
+
+## 上游 `82842fee6e597` 是怎么修的
+
+看一下这个修复的具体代码改动，理解它为什么能打破 AGI/AGF/inode cluster buffer 之间的锁序倒挂。
+
+### 修复前：`xfs_trans_log_inode()` 会在事务执行过程中随时锁 inode cluster buffer
+
+`xfs_trans_log_inode()` 是内核里"标记这个 inode 在当前事务里被改过、需要落盘"的函数，调用点散落在整个 XFS 代码里非常多的地方——只要事务里改了 inode 的任何字段（大小、extent、时间戳……），代码里随手就会调一次。在修复之前，这个函数**做的事情很重**，其中最关键的一段：
+
+```c
+// fs/xfs/libxfs/xfs_trans_inode.c（修复前）
+if (!iip->ili_item.li_buf) {
+        struct xfs_buf  *bp;
+        ...
+        error = xfs_imap_to_bp(ip->i_mount, tp, &ip->i_imap, &bp);
+        ...
+        xfs_buf_hold(bp);
+        iip->ili_item.li_buf = bp;
+        bp->b_flags |= _XBF_INODES;
+        list_add_tail(&iip->ili_item.li_bio_list, &bp->b_li_list);
+        xfs_trans_brelse(tp, bp);
+}
+```
+
+也就是说：**只要这是这个事务里第一次 log 这个 inode，就会立刻去读并"钉住"（pin）这个 inode 所在的 inode cluster buffer**，好让它在 inode 变脏期间不会被提前写回。问题是这段代码**在哪个时间点执行、当时已经持有了哪些别的锁，完全取决于调用它的代码路径**，没有统一安排：
+
+- `unlink`/`ifree` 这条路径（本文 `kworker/2:0` 卡住的那条）：先锁 **AGI**（处理 unlinked inode 链表），链表操作本身要锁 **inode cluster buffer**，然后如果还要做 finobt/inobt 的 btree 维护，才会去锁 **AGF**——顺序是 `AGI -> inode cluster buffer -> AGF`。
+- 延迟分配转换这条路径（本文 `kworker/u34:3` 卡住的那条）：先分配 extent 要锁 **AGF**，分配完之后调 `xfs_trans_log_inode()` 把这次分配结果记到 inode 上，这一步才第一次去锁 **inode cluster buffer**——顺序是 `AGF -> inode cluster buffer`。
+
+两条路径对 AGF 和 inode cluster buffer 的加锁顺序**正好相反**，而 inode cluster buffer 是好几个相邻 inode 共用的（一个 cluster 通常装 32 个 inode），只要这两条路径分别操作的 inode 恰好在同一个 cluster 里，就会撞上 ABBA 死锁——这正是本文 `kworker/2:0` 与 `kworker/u34:3` 之间实际发生的情况。
+
+### 修复思路：把"锁 inode cluster buffer"这件事，挪到事务提交前的固定时机去做
+
+直接去改遍布全代码的 `xfs_trans_log_inode()` 调用点、逐个理清楚加锁顺序，工作量太大也太容易漏。Dave Chinner 的做法是利用 XFS 事务提交流程里已有的一个钩子：`->iop_precommit`——这个回调**保证**在事务的所有修改都做完、包括 AGI、AGF 这些"大件"资源都已经锁好之后，提交前最后统一调用一次。
+
+具体改动（`fs/xfs/xfs_inode_item.c` 新增 `xfs_inode_item_precommit()`，`fs/xfs/libxfs/xfs_trans_inode.c` 精简 `xfs_trans_log_inode()`）：
+
+```c
+// 修复后，xfs_trans_log_inode() 瘦身成只做轻量级记账，不碰任何锁
+void
+xfs_trans_log_inode(...)
+{
+        ...
+        tp->t_flags |= XFS_TRANS_DIRTY;
+        ...
+        iip->ili_dirty_flags |= flags;   // 只记录"哪些字段脏了"，仅此而已
+}
+```
+
+```c
+// 修复后，真正读锁 inode cluster buffer 的逻辑挪到这里，
+// 由事务提交流程在最后统一调用
+static int
+xfs_inode_item_precommit(struct xfs_trans *tp, struct xfs_log_item *lip)
+{
+        ...
+        if (!iip->ili_item.li_buf) {
+                error = xfs_imap_to_bp(ip->i_mount, tp, &ip->i_imap, &bp);
+                ...
+                iip->ili_item.li_buf = bp;
+                ...
+        }
+        ...
+}
+
+static const struct xfs_item_ops xfs_inode_item_ops = {
+        .iop_sort       = xfs_inode_item_sort,       // 新增：按 inode number 排序
+        .iop_precommit  = xfs_inode_item_precommit,  // 新增：提交前统一处理
+        ...
+};
+```
+
+这样一来，不管 `xfs_trans_log_inode()` 在事务执行过程中被调用了多少次、在代码里的什么位置被调用，**真正去锁 inode cluster buffer 的动作，永远被推迟到事务提交前的最后一刻**——那时候 AGI、AGF 这些锁早就已经按 `AGI -> AGF` 的既定顺序锁好了，不会再出现"先锁了 AGF，事务中途才第一次去抢 inode cluster buffer 锁"这种情况。锁序被强制统一成 `AGI -> AGF -> inode cluster buffer`。
+
+另外新增的 `xfs_inode_item_sort()`（按 `i_ino` 排序）解决的是一个相关的次生问题：如果同一个事务里改了不止一个 inode（因而涉及不止一个 cluster buffer），`->iop_precommit` 会对事务里所有脏的 inode log item 挨个调用——排序保证了这种"一个事务修改多个 inode"的场景下，所有事务锁 cluster buffer 的顺序也是一致的（按 inode 号从小到大），避免多 inode 之间再出现另一种 ABBA。
+
+### 为什么这个修复对本文这次故障是对症下药的
+
+本文 vmcore 复核确认的死锁，正是 `kworker/2:0`（`AGI -> inode cluster buffer -> AGF`）与 `kworker/u34:3`（`AGF -> inode cluster buffer`）之间的锁序倒挂，跟这个 commit message 描述的场景一字不差。合入这个修复之后，`kworker/u34:3` 那条延迟分配转换路径不会再在"已经锁了 AGF"的情况下现场去锁 inode cluster buffer——它对 inode 的修改只会被记到 `ili_dirty_flags` 里，真正锁 cluster buffer 的动作要等到事务提交前，此时锁序已经统一，不会再跟 `kworker/2:0` 的 `AGI -> inode cluster buffer -> AGF` 顺序产生倒挂，死锁窗口从代码层面被消除。
+
+## 结论（已按 vmcore 复核结果更新）
+
+1. 触发点**不是**磁盘慢 I/O，而是 XFS 内核代码里一个真实的 **ABBA 循环死锁**（详见「vmcore 复核」一节的完整验证过程）：
+
+   ```
+   kworker/2:0（xfs-inodegc，释放某个 inode）的事务：
+       持有 AGI + 持有该 inode 所在的 inode cluster buffer
+       -> 还需要 AGF（finobt 分裂）-> 卡住
+
+   kworker/u34:3（writeback，回写另一个 inode）的事务：
+       持有 AGF（延迟分配转换时分配过 extent，事务未提交）
+       -> 还需要 inode cluster buffer（写回该 inode）-> 卡住
+   ```
+
+   两个内核线程互相持有对方需要的资源，谁都无法继续，形成循环等待——这是 XFS 代码层面的问题，跟这台主机的 `vdb` 磁盘本身是否健康**无关**（虽然不能完全排除某次慢 I/O 是触发这次死锁的诱因，但死锁一旦形成就会一直卡死，不会随磁盘恢复而自愈）。
+2. `xfs-inodegc` 与 `writeback` 两个 worker 卡在各自的 `xfs_buf_lock` 上，看似是在等对应 buffer 的 I/O 完成（两块 buffer 的 `XBF_DONE` 标志确实都已置位，I/O 早就做完了），实际是在等**对方持有的锁**，是循环等待，不是等 I/O。
+3. 监控/agent 进程大量 D 状态是 `xfs_fs_statfs -> xfs_inodegc_flush -> flush_work` 这条路径的放大效应，但这次**不会自愈**——因为根因是死锁而不是慢 I/O，只要死锁不解除，inodegc worker 就永远不会恢复，所有调用 statfs 的进程也会一直卡住，必须靠重启（或杀掉/绕过其中一个持锁事务）才能解除。
+4. `HTTPHandler` 等建新文件的用户态进程，是被 `kworker/2:0` 持有的 AGI 连带拖下水的**次生受害者**，不是独立的第三个根因。
+
+**局限性说明**：最初分析只拿到了全量 dmesg，没有 vmcore，dmesg 里只能看到"卡在 `xfs_buf_lock` 的 `down()` 上"，看不到这块 buffer 当时的持锁者是谁、在做什么，因此最初误判为"更像是等 I/O，未见死锁证据"。后续在 host 上补拍了一份该 VM 的 vmcore，用 `crash 8.0.2` 做了进一步核实，详见前面「vmcore 复核」一节——**这次确认了是真实的 ABBA 死锁**，纠正了最初的判断。
 
 ## inodegc 特性背景：它是干什么的
 
@@ -321,12 +636,142 @@ xfs_fs_statfs(
 - **内部特性单号**：`CTKfeat: #84056`
 - 上游作者链完整保留：Christoph Hellwig（author）→ Darrick J. Wong / Dave Chinner（review）→ Carlos Maiolino（xfs maintainer 合入 upstream）
 
+## 最终待合入清单：CTyunOS vs openEuler（含真正修复本次故障的提交）
+
+把前面「inodegc 相关修复全景对比」表里梳理出的 6 个修复，加上本次 vmcore 复核确认的 AGF vs inode cluster buffer 死锁修复，按**上游合入版本顺序**合并成一张最终的待办清单。格式沿用前面的对比表，额外加一列**明确标出哪一条才是这次故障的真正根因修复**——除了这一条，其余都只是缓解"放大效应"或修复 inodegc 特性的其他子问题，**都不能解决这次真正卡死的 ABBA 死锁**。
+
+| upstream 提交 | 版本 | CTyunOS `ctkernel-lts-5.10/develop` | openEuler `OLK-5.10` | 是否修复本次故障根因 |
+|---|---|---|---|---|
+| `ab23a7768739` per-cpu deferred inode inactivation queues（特性本身） | v5.15-rc1 | ✅ `705fccfbcf0b8`（release-0090 起含） | ✅ 同 `705fccfbcf0b8` | ❌ 否——这是 inodegc 特性本身，不是修复 |
+| `6191cf3ad59fd` flush inodegc workqueue tasks before cancel | v5.17-rc1 | ❌ 变体躺在未合入的 `lchen/xfs-statfs` 分支 | ✅ `ad0a103e90651` | ❌ 否——只影响 unmount/cancel 场景 |
+| `7cf2b0f9611b9` bound maximum wait time for inodegc work | v5.19-rc5 | ❌ 任何分支都没有 | ✅ `cfb1750859363` | ❌ 否——只是限制 inodegc 最长等待时间 |
+| `5e672cd69f0a53` introduce xfs_inodegc_push() | v5.19-rc5 | ❌ 变体躺在未合入的 `lchen/xfs-statfs` 分支 | ✅ `cc10c7d993f28` | ❌ 否——只消除 statfs 阻塞放大效应，本文重点分析对象 |
+| `04a98a036cf8` flush inode gc workqueue before clearing agi bucket | v6.0-rc1 | ✅ `ef4894f06a4a4`（release-0090 起含） | ✅ 同 `ef4894f06a4a4` | ❌ 否——修的是日志恢复阶段的另一个问题 |
+| **`82842fee6e5979ca7e2bf4d839ef890c22ffb7aa` xfs: fix AGF vs inode cluster buffer deadlock** | **v6.4-rc6** | **❌ 任何分支都没有** | **❌ 任何分支都没有（含 OLK-6.6 之前的所有 5.10 相关分支）** | **✅ 是——这才是这次 `kworker/2:0` 与 `kworker/u34:3` 之间 ABBA 死锁的真正修复** |
+| `62334fab47621` use per-mount cpumask to track nonempty percpu inodegc lists | v6.6-rc3 | ❌ 任何分支都没有 | ❌ 任何分支都没有 | ❌ 否——修的是 CPU 热插拔场景的理论 UAF |
+| `2d873efd174ba` flush inodegc before swapon | v6.14-rc4 | ✅ `6c588c827e2ef`（release-0094 起含） | ❌ 没有 | ❌ 否——只影响 swapon 场景 |
+
+**结论**：8 行里除了特性本身，其余 6 个修复都跟本次故障的死锁根因无关，只是同一个 inodegc 子系统里各自独立的问题（放大效应、UAF、swapon 竞态等），合了也解决不了这次故障会不会复发；真正需要合入以修复本次故障根因的，是 **`82842fee6e597`**（v6.4-rc6）——**CTyunOS 和 openEuler 目前都没有背移植这个修复**，这是本次排查最终应该落地为背移植需求单的那一条。
 ## 后续排查建议
 
-1. 对照该主机同一时间窗口（15:09–15:13）的存储后端/hypervisor 侧监控与日志，确认 `vdb` 是否存在慢 I/O、超时重传或宿主机侧异常。
-2. 检查 `/proc/diskstats` 或历史 `iostat -x` 采样数据，确认 `vdb` 在故障窗口内的 `await`/`svctm` 是否有异常尖峰。
-3. 确认故障是否随宿主机 I/O 恢复而自愈（后续 dmesg 里若无 XFS shutdown / `Corruption of in-memory data` 等信息，说明只是慢，未导致文件系统被强制只读）。若后续能拿到 vmcore，建议用 crash 工具进一步确认 AGF/inode cluster buffer 当时的持锁上下文，排除真正死锁的可能。
-4. **不需要重新 cherry-pick，直接跟 `remotes/ctkernel-lts-5.10/lchen/xfs-statfs` 这个已有分支的作者对齐、把它 rebase 到最新 develop 后合入即可**：分支上的两个提交 `26b5a22d7a83f`（flush inodegc workqueue tasks before cancel）+ `a435f02700ae6`（introduce xfs_inodegc_push）已经是背移植好的版本，只是落后 develop 一段时间没跟上。
+1. ~~对照该主机同一时间窗口（15:09–15:13）的存储后端/hypervisor 侧监控与日志，确认 `vdb` 是否存在慢 I/O、超时重传或宿主机侧异常。~~ **已由 vmcore 复核推翻**：根因不是存储侧慢 I/O，是 XFS 内核代码里的 ABBA 死锁，这条排查方向可以停止，不用再往存储侧查了。
+2. ~~检查 `/proc/diskstats` 或历史 `iostat -x` 采样数据，确认 `vdb` 在故障窗口内的 `await`/`svctm` 是否有异常尖峰。~~ 同上，已确认与磁盘本身健康状况无关，不用再查。
+3. ~~确认故障是否随宿主机 I/O 恢复而自愈……若后续能拿到 vmcore，建议用 crash 工具进一步确认持锁上下文，排除真正死锁的可能。~~ **已完成**：vmcore 已拿到并复核过，用 `crash` + `b_transp -> t_ticket -> t_task` 确认了是 `kworker/2:0`（持有 AGI + inode cluster buffer）与 `kworker/u34:3`（持有 AGF）之间的真实 ABBA 循环死锁，详见「vmcore 复核」一节，不会自愈，必须靠重启解除。
+4. **不需要重新 cherry-pick，直接跟 `remotes/ctkernel-lts-5.10/lchen/xfs-statfs` 这个已有分支的作者对齐、把它 rebase 到最新 develop 后合入即可**：分支上的两个提交 `26b5a22d7a83f`（flush inodegc workqueue tasks before cancel）+ `a435f02700ae6`（introduce xfs_inodegc_push）已经是背移植好的版本，只是落后 develop 一段时间没跟上。**注意**：这两个补丁能缓解放大效应（减少被连带拖死的无关进程数量），但**不能修复这次发现的 ABBA 死锁本身**，二者需要分开立项跟踪。
 5. 额外建议补齐 `7cf2b0f9611b9`（bound maximum wait time for inodegc work，v5.19-rc5）：这个修复目前在 CTyunOS 任何分支里都不存在，openEuler `OLK-5.10` 已有对应版本 `cfb1750859363`，可以直接参考背移植。
 6. 再额外建议补齐 `62334fab47621`（use per-mount cpumask to track nonempty percpu inodegc lists，v6.6-rc3）：这个修复 openEuler 也没有，没有现成版本可抄，需要直接从 upstream cherry-pick，建议和上面几个一起统一排期背移植。
-7. 这个内核补丁解决的是"慢盘不该拖死无关进程"这个放大效应，并不能让 `vdb` 本身变快，也不保证解决真正的 buffer 锁死锁——存储侧的慢 I/O 根因仍需按第 1、2 条单独排查，死锁可能性需要 vmcore 才能排除。
+7. **新增（vmcore 复核后追加，已查明）**：这次确认的 `kworker/2:0`（AGI + inode cluster buffer）与 `kworker/u34:3`（AGF）之间的 ABBA 死锁，**是一个上游早已确认、有名有姓的已知 bug，不是本次新发现的未知问题**：
+
+   - **引入 bug 的提交**：`298f7bec503f`("xfs: pin inode backing buffer to the inode log item")，**v5.9-rc1** 合入（2020-07-07），比 5.10 还早——CTyunOS `ctkernel-lts-5.10/develop` 和 openEuler `OLK-5.10` **都确认包含**这个提交，也就是说两家从 5.10 发布那天起就带着这个 bug。
+   - **修复提交**：`82842fee6e5979ca7e2bf4d839ef890c22ffb7aa`("xfs: fix AGF vs inode cluster buffer deadlock"，作者 Dave Chinner)，**v6.4-rc6** 才合入（2023-06-05），比引入 bug 的提交晚了将近 3 年。commit message 描述的锁序倒挂场景（"AGI -> inode cluster buffer -> AGF" vs "AGF -> inode cluster buffer"）跟这次 vmcore 挖出来的两个 worker 的加锁顺序**完全一致**。修复方式是把 `xfs_trans_log_inode()` 里锁 inode cluster buffer 的部分挪到事务提交前的 `->iop_precommit` 阶段，避免过早抢占该锁。
+   - 用 `git merge-base --is-ancestor` 核实：这个修复提交在 CTyunOS `ctkernel-lts-5.10/develop` 和 openEuler `OLK-5.10` 里**均不存在**——两家目前都还暴露在这个死锁下。
+   - 该修复后来也进了 stable 树（`65fc94fc8774146ab96d7c20f138cfab1a4db6f2`，backport 进 **v6.1.112**，2024-09-30，Leah Rumancik 背的），说明上游认为这个问题足够严重、值得单独 backport 到 stable 分支，不是可以忽略的边角案例。
+   - **下一步建议**：把 `82842fee6e597` 这个修复（或对应的 stable 变体）背移植到 CTyunOS 5.10 分支，这是解决这次死锁根因的直接手段，跟 `xfs_inodegc_push` 系列补丁是完全独立的两件事，需要分开立项、分开评审。
+   - 死锁一旦形成无法自愈，建议给运维侧一个应急预案：出现类似"大量业务进程 D 状态 + hung_task 告警"且怀疑是这一类死锁时，除了走 `statfs` 放大链路的常规排查，也要考虑直接重启实例，不必浪费时间等待存储侧自愈。
+8. 这批 `xfs_inodegc_push` 系列补丁解决的是"故障拖死无关进程"这个放大效应，**不能让死锁本身消失**——死锁的根因排查见第 7 条，跟这批补丁是两件事，评估收益时不要混为一谈。
+
+## 附：同一处代码在另一台主机（长沙42-os）上的独立复现
+
+**注意：这是另一个资源池、另一台主机、另一次独立故障，不是本文前面分析的那次故障，两者互不相关，只是命中了同一处内核代码。** 对应日志文件：`messages-20260724`。
+
+### 故障通报原文
+
+```
+【故障名称】2026年7月21日湖南高速信息科技有限公司（企业级）ck数据库无法连接故障进度通报
+【故障现象】ck数据库无法连接
+【业务影响】路网应急系统（用户反馈市长在现场等待演示）
+【客服系统资源池】长沙42-os
+【故障原因】待定
+【故障发生时间】2026-07-21 08:20:00
+【故障升级时间】2026-07-21 08:39:00
+【故障恢复时间】2026-07-21 09:37:00
+【影响实例信息】
+实例信息：43.65.3.106
+3d305b5e9e95474f9572491a73e78fca
+主机uuid：ae25d315-e9e3-4800-3069-1b9aff4a5d04
+
+#故障进展
+08:39 已拉通数据库指挥长上会沟通
+09:00 数据库反馈当前底层卡顿，已拉通存储运维、计算运维入会核实
+09:05 核实存储底层磁盘时延、挂载、IO正常，但数据库底层无法执行命令，继续排查中
+09:15 现测试存储节点到宿主机节点存在丢包，已拉通物理网运维查看，同时正在核实是否与昨晚变更相关
+09:30 客户反馈只涉及该问题实例异常，其余实例正常，准备重启实例尝试快恢
+09:37 重启实例虚机完成，业务反馈已恢复
+10:50 现业务重启后已恢复，观测暂无异常，已收集相关信息反馈线下群内进行分析，会议线上暂时闭环
+```
+
+### 日志与故障通报的对照
+
+`messages-20260724` 里的 `xfs-inodegc/vdb xfs_inodegc_worker` 卡在 `xfs_buf_lock -> down()` 这条调用栈，和本文正文分析的那次故障（不同主机）代码路径完全一致，参见前面「相同点」的调用栈对比。
+
+但结合故障通报的时间线重新看这份日志，之前"卡了一下就自愈了"的判断需要修正：
+
+- hung_task 告警一共只出现了 **10 条**（07:32:49 一批 6 条 + 07:34:52 一批 4 条），此后到 09:36:29 重启前再没有任何新的 hung_task 告警。这不是因为卡顿解除了，而是命中了内核 `hung_task_warnings` sysctl 的默认值 **10**——一旦打印满 10 条告警，内核就不再继续打印新的告警，但*被卡的任务本身并不会因此解除阻塞*，这是一个纯粹的日志计数上限，不是恢复的信号。
+- 07:37–09:32 之间日志里能看到的 `NetworkManager`（网络心跳）持续正常、以及 09:33 有一次正常的 SSH 登录，说明网络栈和登录/进程调度还能用，但**不代表 XFS/vdb 这条 I/O 路径已经恢复**——故障通报里 09:05 也明确写了"数据库底层无法执行命令"，即数据库自身的 I/O 相关命令始终执行不了，和"网络/SSH 能用但磁盘 I/O 卡住"完全吻合。
+- 09:32:38 日志里的 `systemctl start clickhouse-server` 命令，对应的正是故障通报里运维人员 09:30 前后现场排查、尝试拉起服务的动作，而不是业务已经自愈后的常规操作。
+- 真正解除阻塞的动作是故障通报里 09:37 的**重启实例虚机**，与日志里 09:36:29 的重启时间点吻合——即这次故障是靠**重启虚机**强制解除的，而不是像本文正文那次故障一样自己等 I/O 恢复后解除。
+
+结论：这台主机的故障持续时间和官方通报的 **08:20–09:37（约 77 分钟）** 基本吻合，比正文那次故障（几分钟量级）严重得多；由于运维现场同时观察到"存储节点到宿主机丢包"，不排除这次是**网络丢包导致 vdb 的 I/O 长时间彻底不返回**（而不是短暂抖动），使得 `xfs-inodegc` worker 卡住的buffer 锁长期得不到 I/O completion 释放，只能靠重启虚机才能打断，正文那次故障后来经 vmcore 复核确认是真实的 ABBA 死锁（见「结论」及「vmcore 复核」一节）——但这台"43"主机目前只做过 dmesg 级别的分析，没有对应的 vmcore，还不能照搬同样的结论，只能说这次的持续时间和最终靠重启才解决，更像是 severity 更高的同一类问题，而不是一次轻微抖动，具体是不是同一种 ABBA 死锁需要 vmcore 才能坐实。
+
+### `hung_task_warnings` 到底是不是 10：两份日志交叉验证 + 内核代码依据
+
+**两份日志都恰好只打印了 10 条 hung_task 告警，批次划分却完全不同，强烈指向同一个日志计数上限，而不是巧合：**
+
+| 日志 | 批次 1 | 批次 2 | 合计 |
+|---|---|---|---|
+| 正文（`dmesg.click.7.21.1.log`，15:11:00/15:13:03） | 5 条（`19100_node_expo`、`BgSchPool`、`AsyncMetrics`、`kworker/u34:3`、`kworker/2:0`） | 5 条（`telegraf`、`19100_node_expo` 再次、`titanagent`、`BgSchPool` 再次、`AsyncMetrics` 再次） | **10** |
+| 本节（`messages-20260724`，07:32:49/07:34:52） | 6 条（`telegraf`、`BgSchPool`、`AsyncMetrics`、`node_exporter`、`kworker/u33:0`、`kworker/2:2`） | 4 条（`telegraf` 再次、`BgSchPool` 再次、`AsyncMetrics` 再次、`dcp-agent`） | **10** |
+
+**内核代码依据**（当前仓库 `kernel/hung_task.c`，对照过故障机实际跑的 `ctkernel-lts-5.10/develop` 分支同一文件，逻辑与默认值完全一致）：
+
+```c
+// kernel/hung_task.c:60
+static int __read_mostly sysctl_hung_task_warnings = 10;
+```
+
+```c
+// kernel/hung_task.c:249-268，hung_task_info() 打印每一条 "INFO: task ... blocked" 之前的判断
+if (sysctl_hung_task_warnings || hung_task_call_panic) {
+        if (sysctl_hung_task_warnings > 0)
+                sysctl_hung_task_warnings--;
+        pr_err("INFO: task %s:%d blocked%s for more than %ld seconds.\n", ...);
+        ...
+        if (!sysctl_hung_task_warnings)
+                pr_info("Future hung task reports are suppressed, see sysctl kernel.hung_task_warnings\n");
+}
+```
+
+即每打印一条告警就把这个计数器减 1，减到 0 之后 `if` 条件不再满足，**后续再有任务被判定为 hung，也不会打印任何东西**——是静默停止，不是问题解决了。`ctkernel-lts-5.10/develop` 的 `kernel/hung_task.c` 里同样是 `int __read_mostly sysctl_hung_task_warnings = 10;`，默认值和逻辑与 mainline 一致。
+
+**一个额外的坑**：mainline 后来在 `pr_info("Future hung task reports are suppressed...")` 这行提示上做了改进（commit `b1f712b308dcd`，约 2023 年合入），5.10 vendor 树里**没有**这个提示——所以打光额度后日志上什么提示都不会有，只是安安静静地不再有新的 "INFO: task ... blocked" 出现，这也是本节一开始容易被误判成"卡顿自愈了"的原因。
+
+**这不是"某段时间窗口内 10 次"，而是开机以来的累计余额，打光后永久静默**：翻遍 `kernel/hung_task.c` 全文，`sysctl_hung_task_warnings` 只有上面那一处递减逻辑，**没有任何地方会把它加回去**——不是滑动窗口、不会过一阵子自动恢复，是从**这次开机（或上一次手动重置）以来**的累计计数，减到 0 后永久停止打印，直到：
+
+1. **重启**（静态变量重新初始化为 10），或
+2. 手动写 sysctl：`echo 10 > /proc/sys/kernel/hung_task_warnings`（或写 `-1` 变成不限次数）
+
+`messages-20260724` 这台机器的时间戳 `[19665253.xxx]` 折算约 **227 天**开机时长，而这次 07:32-07:34 的两批告警（6+4）恰好精确用满 10——如果这 227 天里更早还触发过别的 hung_task 告警，余额不可能在这次事件里正好被用得一分不剩。也就是说，这是这台机器**这次开机以来第一次、也是唯一一次**触发 hung_task 检测，额度是被这次事件完整、干净地用光的，不是叠加了历史上其他事件的余量。
+
+**两份日志证据强度的区别**（严谨起见需要分开看）：
+
+- `messages-20260724` 是持续写入的 syslog，第 10 条告警之后**继续观测了近 2 小时、期间确实再无任何新的 kernel 标签日志**，这是"额度打光而非已恢复"比较扎实的旁证。
+- `dmesg.click.7.21.1.log` 更像是某个时间点抓取的 `dmesg` 快照，文件恰好在第 10 条告警的调用栈之后结束——不能排除"抓取时间点恰好在此附近"的巧合，没有类似"之后持续观测无新增"的独立佐证，只能说两份日志"总数都是 10"这一点本身就是很强的旁证，但对"之后是否被抑制"这件事，两份日志的确定性并不对等。
+
+结合起来看：两次故障大概率都命中了同一个 `hung_task_warnings=10` 的默认额度，日志"没有更多告警"**不能**被当作"卡顿已经解除"的证据——这也是为什么正文「结论」里强调"没有 vmcore 无法 100% 确认持锁上下文"，以及本节现在把"长沙42 故障"的持续时间订正为跟着官方通报走（08:20–09:37），而不是只看 dmesg 里最后一条告警的时间点。
+
+### 这批补丁能不能彻底解决 D 状态问题
+
+> **本节结论需要结合「vmcore 复核」的最新发现重新评估：正文这次故障的根因确认是真实的 ABBA 死锁，不是慢 I/O。下面分两部分说：一是原来"消除放大效应"的判断依然成立、依然值得合入；二是死锁本身这批补丁完全解决不了，需要单独看待。**
+
+**1. `xfs_inodegc_push()` 这类补丁能解决的，依然只是"放大"这一层**：把 `xfs_fs_statfs()` 从阻塞式 `flush` 改成非阻塞的 `push` 之后，即使 `xfs-inodegc` worker 本身还卡着（不管是卡在慢 I/O 还是卡在死锁），只是定时调 `statfs`/`df` 采集容量的监控/agent 进程（`telegraf`、`node_exporter`、`BgSchPool` 等）不会再被一起拖进 D 状态。这个结论不受"根因是死锁还是慢 I/O"影响，依然是应该合入的正确修复。
+
+**2. 但死锁本身，这批补丁完全解决不了**——这是这次 vmcore 复核之后必须补充的新结论：
+
+- `kworker/2:0`（xfs-inodegc）与 `kworker/u34:3`（writeback）之间的 ABBA 循环死锁，一旦形成就是**永久性**的，不会随时间或 I/O 恢复而自愈。`xfs_inodegc_push` 只是让 `statfs` 不再阻塞式等待 inodegc 队列，但 inodegc 队列本身（连同 writeback 那条链路）永远卡死，**该 AG 上所有需要 AGI/AGF/这块 inode cluster buffer 的后续操作都会持续挂起**——包括本文提到的 `HTTPHandler` 建新文件，合了 `xfs_inodegc_push` 之后它照样会卡，因为它卡的是 AGI 被 `kworker/2:0` 攥着，跟 `statfs` 阻塞放大链路完全无关。
+- 换句话说：合了 `xfs_inodegc_push` 之后，**表面上看起来会"好一点"**——不会再有一大片监控 agent 进程一起进 D 状态、hung_task 告警的数量会大幅减少——但**这台机器这个 AG 的文件系统操作实质上已经死了**，只是死锁的影响范围从"全站瘫痪"缩小成了"这个 AG 相关的文件操作瘫痪"，业务侧仍然会持续故障，只有重启或者手工干预（比如 kill 掉其中一个卡住的 kworker 触发事务回滚，如果内核支持的话）才能解除。
+- 这是否是一个**已知的、上游已经修过的 XFS bug**，还是这台内核版本上一个尚未被发现/修复的问题，需要额外去查（比如对照更新的内核版本源码，看 `xfs_difree`/`xfs_bmap_btalloc` 涉及 AGI/AGF/inode cluster buffer 加锁顺序的部分有没有相关的 fix commit），这部分工作本文目前还没有做，是后续排查建议里需要补的一项。
+
+**3. 长沙42 那次故障（`messages-20260724`）目前还只做了 dmesg 级别的分析，没有对应的 vmcore**，所以还不能确定它是不是同样的 ABBA 死锁，还是真的只是慢 I/O/丢包导致的临时卡顿（`clickhouse-server` 反复重启失败这条证据本身两种情况都能解释）。如果条件允许，建议对这类故障也尽量保留 vmcore，用本节这套方法复核，而不要默认套用"等 I/O，会自愈"的结论。
+
+**结论**：`xfs_inodegc_push` 这类补丁值得合入，但评估收益时不能再说"合了就能解决这次故障"——它只解决了故障的**放大效应**，正文这次事故真正的根因是一个 XFS 内核代码里的 ABBA 死锁，合了这批补丁之后死锁依然会发生，只是波及范围会小很多、告警会少很多，容易被误判成"问题解决了"。这个死锁本身需要作为一个独立的问题去定位、修复，不能和 `xfs_inodegc_push` 这条 statfs 优化混为一谈。
+
