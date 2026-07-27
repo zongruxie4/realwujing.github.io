@@ -49,6 +49,8 @@ KERNEL_4_19_BRANCH ?= openeuler-4-19/release-0062.y
 NUMA_NODE ?= $(shell grep MemFree /sys/devices/system/node/node*/meminfo | sort -k4 -nr | head -1 | sed 's/.*node//; s,/.*,,')
 # All logical CPUs of NUMA node NUMA_NODE (cpulist range form, e.g. 96-119,288-311)
 DOCKER_CPUSET_CPUS := $(shell cat /sys/devices/system/node/node$(NUMA_NODE)/cpulist)
+# Number of logical CPUs in DOCKER_CPUSET_CPUS (expands ranges like "96-119,288-311")
+NUMA_CPU_COUNT := $(shell echo "$(DOCKER_CPUSET_CPUS)" | awk -F',' '{s=0; for(i=1;i<=NF;i++){if($$i ~ /-/){split($$i,b,"-"); s+=b[2]-b[1]+1}else{s+=1}}; print s}')
 
 # Docker run options with user mapping
 DOCKER_RUN_OPTS := -it \
@@ -82,6 +84,10 @@ endef
 
 help:	## Show this help message
 	@echo "CTYunOS 2 Docker Environment Makefile"
+	@echo ""
+	@echo "CPU / NUMA (build container is pinned to one NUMA node to avoid cross-NUMA memory access):"
+	@echo "  NUMA node:  $(NUMA_NODE) (auto: most free memory; override with NUMA_NODE=N)"
+	@echo "  CPU cores:  $(NUMA_CPU_COUNT) (cpuset: $(DOCKER_CPUSET_CPUS))"
 	@echo ""
 	@echo "Build commands:"
 	@echo "  Default branch: 4.19=$(KERNEL_4_19_BRANCH)"
