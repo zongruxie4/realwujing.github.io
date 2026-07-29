@@ -1255,12 +1255,12 @@ vim -t select_idle_sibling
 ```bash
 git show HEAD
 commit a90c573c74f55930f3b770ec67d7a84528e8dac8 (HEAD -> master)
-Author: QiLiang Yuan <yuanql9@chinatelecom.cn>
+Author: Jing Wu <realwujing@gmail.com>
 Date:   Thu Jul 18 23:18:24 2024 +0800
 
     sched/fair: Fix wrong cpu selecting from isolated domain
 
-    Signed-off-by: QiLiang Yuan <yuanql9@chinatelecom.cn>
+    Signed-off-by: Jing Wu <realwujing@gmail.com>
 
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
 index f58f13545450..30f32641a45c 100644

@@ -25,7 +25,7 @@ dropping the nsid_lock to safely call sleepy rtnl_net_notifyid().
 Clean up redundant nsid_lock and simplify the destruction loop now that
 unhashing is centralized.
 
-Signed-off-by: Qiliang Yuan <yuanql9@chinatelecom.cn>
+Signed-off-by: Jing Wu <realwujing@gmail.com>
 Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
 Link: https://patch.msgid.link/20260204074854.3506916-1-realwujing@gmail.com
 Signed-off-by: Jakub Kicinski <kuba@kernel.org>

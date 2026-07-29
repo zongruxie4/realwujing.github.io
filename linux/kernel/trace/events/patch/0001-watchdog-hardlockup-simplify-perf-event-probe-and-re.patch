@@ -14,9 +14,9 @@ manage a temporary event without the risk of leaving stale pointers should
 task migration occur.
 
 Link: https://lkml.kernel.org/r/20260129022629.2201331-1-realwujing@gmail.com
-Signed-off-by: Shouxin Sun <sunshx@chinatelecom.cn>
-Signed-off-by: Junnan Zhang <zhangjn11@chinatelecom.cn>
-Signed-off-by: Qiliang Yuan <yuanql9@chinatelecom.cn>
+Signed-off-by: Jing Wu <realwujing@gmail.com>
+Signed-off-by: Jing Wu <realwujing@gmail.com>
+Signed-off-by: Jing Wu <realwujing@gmail.com>
 Signed-off-by: Qiliang Yuan <realwujing@gmail.com>
 Reviewed-by: Douglas Anderson <dianders@chromium.org>
 Cc: Jinchao Wang <wangjinchao600@gmail.com>

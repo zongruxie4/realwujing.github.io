@@ -1,9 +1,9 @@
 From f6555fdbf7b9b82d5258897c46338d2b85d19a01 Mon Sep 17 00:00:00 2001
-From: QiLiang Yuan <yuanql9@chinatelecom.cn>
+From: Jing Wu <realwujing@gmail.com>
 Date: Fri, 29 Nov 2024 12:27:45 +0800
 Subject: [PATCH] arm64: sched: cfs: ksmd
 
-Signed-off-by: QiLiang Yuan <yuanql9@chinatelecom.cn>
+Signed-off-by: Jing Wu <realwujing@gmail.com>
 ---
  kernel/sched/core.c     |  31 ++++++++-
  kernel/sched/fair.c     | 145 +++++++++++++++++++++++++++++++++++++---

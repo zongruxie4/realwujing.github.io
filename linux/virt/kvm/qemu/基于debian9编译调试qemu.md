@@ -128,7 +128,7 @@ Date:   Sun Jun 8 19:43:06 2025 +0800
     "(](https://blog.csdn.net/FJDJFKDJFKDJFKD/article/details/105982709)
     
     Signed-off-by: wujing <realwujing@qq.com>
-    Signed-off-by: QiLiang Yuan <yuanql9@chinatelecom.cn>
+    Signed-off-by: Jing Wu <realwujing@gmail.com>
 
 diff --git a/include/qemu/bitops.h b/include/qemu/bitops.h
 index 1881284..cb49cbf 100644

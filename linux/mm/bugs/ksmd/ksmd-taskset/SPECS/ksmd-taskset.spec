@@ -49,5 +49,5 @@ fi
 /bin/systemctl daemon-reload
 
 %changelog
-* Thu Aug 01 2024 QiLiang Yuan <yuanql9@chinatelecom.cn> - 1.0-1
+* Thu Aug 01 2024 Jing Wu <realwujing@gmail.com> - 1.0-1
 - Initial package

@@ -15,7 +15,7 @@ O(Range Size) to O(Active FDs), providing a significant performance boost
 for large-range close operations on sparse file descriptor tables.
 
 Signed-off-by: Qiliang Yuan <realwujing@gmail.com>
-Signed-off-by: Qiliang Yuan <yuanql9@chinatelecom.cn>
+Signed-off-by: Jing Wu <realwujing@gmail.com>
 Link: https://patch.msgid.link/20260123081221.659125-1-realwujing@gmail.com
 Signed-off-by: Christian Brauner <brauner@kernel.org>
 ---
