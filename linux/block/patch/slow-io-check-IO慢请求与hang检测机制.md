@@ -332,3 +332,46 @@ core_initcall(blk_sysctl_init);
 
 - d2c 计数器部分：2019-06-04 以 `[RFC] block: add counter to track io request's d2c time` 投过 linux-block@vger.kernel.org。Chaitanya Kulkarni（Oracle）问了句"能不能配个 iostat patch"，作者回复"稍后补"，此后再无 v2、无 maintainer ack，**未合入 mainline**。
 - 其余 5 个提交（含 wait_res 整套机制、周期性 hang 检测、sysctl 重命名空间）**从未投递过 LKML**，均为下游（anolis 云内核）专属特性。
+
+## 五、代码 Review 意见
+
+用 `scripts/checkpatch.pl` 对这 6 个提交逐个跑了一遍，再结合读代码交叉验证，汇总如下（不是泛泛的风格问题，逻辑都经过代码验证）：
+
+| 优先级 | 提交 | 位置 | 问题 |
+|---|---|---|---|
+| 高 | `d3a548a` anolis: fs: record page or bio info while process is waitting on it | `fs/proc/base.c`（`proc_wait_res()` 及其注册） | `/proc/<pid>/wait_res` 注册成 `0444`（全局可读）且用 `%px` 打印原始内核指针，**没有任何权限检查**。对比同一个文件里 `proc_pid_stack`（`S_IRUSR` + `ptrace_may_access(PTRACE_MODE_READ_FSCREDS)`）——同样是"泄露内核地址"的接口，这个新增的却漏掉了访问控制，任意本地用户都能读到别的进程正在等待的 folio/bio/request 内核指针，协助 KASLR 绕过。checkpatch 也标了 `%px` 的警告。 |
+| 高 | `342b127` block: add periodic iohang detection with sysctl control | `block/blk-core.c`（`blk_alloc_queue()`） | `blk_alloc_queue()` 只 `timer_setup()` 注册了 `hang_check_timer`，从不调用 `blk_start_hang_check_timer()`。定时器只在 sysctl 从 0→非0 写入的那一刻，通过 `blk_set_all_hang_check_timers()` 遍历**当时已存在**的 block 设备去启动。**功能开启之后新插入/新建的盘（NVMe 热插拔、loop/dm 设备等）永远不会被监控**，除非管理员手动把 `iohang_check_interval` 关了再开一次——这恰好是这个特性最该发挥作用的场景（生产环境热插盘）。 |
+| 中 | `16ed0ab` block: add a sysctl parameter to control d2c show | `block/blk-mq.c`（`blk_account_io_done()`）+ `Documentation/admin-guide/iostats.rst` | `d2c_io_delay_show_enable` 不只控制"是否显示"这三列，还直接控制 `part_stat_add(..., d2c_nsecs...)` 这个底层累加**是否执行**。但文档写的是"这些字段默认隐藏，运行时可以打开"，暗示数据一直在采、只是没显示——实际打开开关后历史数据是空的，因为压根没采过，文档跟实现不一致。 |
+| 中 | `16ed0ab` block: add a sysctl parameter to control d2c show | `block/blk-mq.c`（`blk_account_io_done()`） | d2c 超阈值告警复用了 `rq_hang_threshold`（默认 5000ms，本来是给"彻底 hang 住"用的）。代码注释自己也承认是"approximate replacement"。驱动侧时延要卡到接近"判定为 hang"的量级才会告警，跟这个特性名字"slow-io-check"（抓**慢**，不是抓**死**）的初衷基本对不上——没有一个独立、可单独调节的 d2c 阈值。 |
+| 中 | `16ed0ab` block: add a sysctl parameter to control d2c show / `342b127` block: add periodic iohang detection with sysctl control（终态在 `block/blk-sysctl.c`，源头见 `c4cce6d` block: move iohang_check_interval and d2c_io_delay_show_enable sysctl to block subsystem） | `block/blk-sysctl.c` | checkpatch **ERROR**：全局变量显式初始化成 0（`... __read_mostly = 0;`，应省略 `= 0` 让它落进 `.bss`）。这个问题从 16ed0ab 引入，一路带到 c4cce6d 之后的最终位置仍未修，真要投上游会被直接打回。 |
+| 低中 | `f6486a7` block: extend wait_res for I/O hang detection | `mm/page-writeback.c`（`folio_wait_writeback()`/`_killable()`） | wait_res 埋点的门槛不一致：`wait_on_buffer()`/`lock_buffer()` 都是先判断"确实要等"才 `task_set_wait_res()`；但这两个函数是不管三七二十一先设置，再判断要不要等。如果这次调用 folio 根本没在 writeback，会有一个极短窗口让 `/proc/pid/wait_res` 显示"正在等 writeback"，而实际上这个线程根本没阻塞过——诊断工具本身的准确性打了折扣。 |
+| 低 | `342b127` block: add periodic iohang detection with sysctl control（在 `c4cce6d` block: move iohang_check_interval and d2c_io_delay_show_enable sysctl to block subsystem 里已修） | `block/blk-core.c`、`kernel/sysctl.c`（中间态） | checkpatch WARNING：`extern` 声明散落在 `.c` 文件里而不是头文件。只存在于 342b127 这个中间提交，两个提交之后被 c4cce6d 清理掉了，不影响最终状态。 |
+| 低 | `16ed0ab` block: add a sysctl parameter to control d2c show | `block/genhd.c` | 风格小问题：应该用 `seq_puts` 而不是 `seq_printf(seqf, "\n")`（checkpatch 提示）。 |
+
+**小结**：这 6 个提交里最值得优先处理的是前两条高优先级问题——一个是真实的本地信息泄露（权限模型缺失），一个是这个特性在最该发挥作用的场景（热插盘）里反而会静默失效，都不是风格问题，是会直接影响这个特性能不能达到设计目的的实质缺陷。中优先级的三条集中在 d2c 告警这一块：阈值复用、开关语义和文档不一致、以及一处 checkpatch ERROR 级别的全局变量初始化问题，如果要往上游投，这几条基本是必须先解决的。
+
+## 六、追加提交：关联等待进程与内核栈
+
+针对第五节里"排障还需要人工两步关联"这一点（`wait_res` 里的地址得手工去 `rq_hang` 里搜），补了一个提交，把两条链路在内核态直接连起来。
+
+**问题**：`blk_mq_debugfs_rq_hang_show()` 打印的是 hung request 自己的字段（op/tag/state/bio/page 地址），完全不知道有没有进程在等它；`wait_res` 记录了某个进程在等哪个 page/bio/request，但反过来没有办法从一个 hung request 找到是谁在等它。两条信息链路各自独立，只能靠管理员拿地址人工去对。
+
+**实现**：在 `blk_mq_check_rq_hang()` 判定某个 request 确实超阈值之后，反向查一下有没有线程的 `wait_res`（`wait_bio`/`wait_folio`/`wait_request`）指向这个 request 自己的 bio/folio 链，命中就把等待者的 comm/pid/等待时长打印在同一行，并且**只在周期定时器路径**（dmesg 场景，不是 debugfs 手动 cat）额外调用 `sched_show_task()` 把它的内核栈也打出来——一条日志就能同时看到"卡住的 request 详情"和"卡住的进程栈"，不用再靠地址人工二次关联。
+
+第一版实现是直接对每个 hung request 反向扫一遍全部线程（`for_each_process_thread()`），复杂度是 `O(hung_requests × 等待中的线程数 × 每个request的bio数)`——发现问题后改成了哈希索引方案：
+
+```c
+// block/blk-mq-debugfs.c
+struct blk_hang_waiters {
+    DECLARE_HASHTABLE(table, BLK_HANG_WAITER_HBITS);
+};
+```
+
+- `blk_mq_check_rq_hang()` 只有在**这次 scan 第一次**找到 hung request 时，才触发 `blk_hang_waiters_build()`——没有 hung request 的常见情况完全不用付这个代价；
+- `blk_hang_waiters_build()` 遍历一次 `for_each_process_thread()`，把每个线程的 `wait_bio`/`wait_folio`/`wait_request` 指针值建进哈希表（`get_task_struct()` 钉住，避免释放后悬空），遍历方式参考了 `kernel/hung_task.c` 的 `rcu_lock_break()` 周期性放开 RCU 锁的写法；
+- 每个 hung request 只需要遍历**自己**的 bio/page 链（本来就要走一遍来打印地址），对每个地址做 O(1) 哈希查找，不再遍历全部线程；
+- `queue_rq_hang_show()`（debugfs 读）和 `blk_hang_check_work()`（定时器）各自 scan 结束后调用 `blk_hang_show_ctx_cleanup()` 释放哈希表、归还 task 引用。
+
+复杂度从 `O(hung_requests × 等待线程数 × 每个request的bio数)` 降到 `O(线程数)`（每次 scan 一次）`+ O(hung_requests × 每个request的bio数)`（哈希查找）。
+
+已通过编译验证：单独编译 `block/blk-mq-debugfs.o`/`block/blk-core.o`（含 `-W1`）无警告无报错，`nm` 确认跨文件符号正确解析，整个 `block/` 子系统全量编译并打包成 `block/built-in.a` 无误。
